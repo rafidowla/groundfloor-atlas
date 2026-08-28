@@ -1,0 +1,125 @@
+Groundfloor Atlas (Atlas)
+Copyright 2026 Groundfloor (codementeam)
+
+This product is licensed under the Apache License, Version 2.0 (see the
+LICENSE file). It includes and depends on third-party software listed below.
+Atlas's own code and its direct production dependencies are permissively
+licensed (Apache-2.0, MIT, or ISC). Two third-party exceptions are disclosed
+below: the embedded @groundfloor/lore knowledge layer (Elastic-2.0), and the
+prebuilt libvips binaries that sharp's platform packages install
+(LGPL-3.0-or-later — a weak copyleft covering those binaries, not Atlas's
+code). Re-run scripts/check-license-headers.mjs to re-verify the licensing
+story after a dependency change.
+
+================================================================================
+Direct production dependencies (this package — @groundfloor/atlas)
+================================================================================
+
+  @modelcontextprotocol/sdk ............ MIT
+  graphology ........................... MIT
+  graphology-communities-louvain ....... MIT
+  graphology-components ................ MIT
+  graphology-pagerank .................. MIT
+  web-tree-sitter ...................... MIT
+
+  Tree-sitter grammars vendored under grammars/ (WASM builds used by the
+  parser) each carry their own upstream license (predominantly MIT / Apache-2.0)
+  in their source repositories; they are redistributed here unmodified.
+
+================================================================================
+Embedded knowledge-layer dependency: @groundfloor/lore
+================================================================================
+
+  @groundfloor/lore ..................... Elastic License 2.0 (ELv2)
+
+Atlas embeds a dedicated Lore instance in-process (vendored, not a network
+call) — this is Atlas's ONE non-permissive production dependency, and it is a
+deliberate choice, not an oversight. Apache-2.0 is not a viral/copyleft
+license: an Apache-licensed application embedding an ELv2 library in-process
+is not a licensing conflict, the same way any Apache project may depend on a
+commercially-licensed library. ELv2 itself principally restricts offering the
+licensed software AS A HOSTED SERVICE to third parties and circumventing its
+license keys — it does not restrict Atlas's own code, and Atlas's own code
+here remains 100% Apache-2.0.
+
+Practical implication for anyone building on Atlas: do not repackage Atlas's
+embedded-Lore access as a way to offer Lore's own recall/store/query surface
+as a hosted service to others — that would functionally recreate what ELv2
+exists to prevent, regardless of Atlas's own license. Atlas's own value is
+the code-intelligence and IDE-integration layer (tree-sitter parsing,
+cross-file resolution, blast-radius/layer analysis, the MCP surface, curated
+semantic writes) built on top of the knowledge layer, not a pass-through to
+the knowledge layer itself.
+
+This license is asserted, not just declared here: scripts/check-license-headers.mjs
+fails loudly if @groundfloor/lore's own package.json ever reports a license
+other than Elastic-2.0, so a future upstream change cannot ship into an
+Apache-2.0 release of Atlas unnoticed.
+
+--------------------------------------------------------------------------------
+Lore's own dependency stack (pulled in transitively)
+--------------------------------------------------------------------------------
+
+The rebuildable index stack (graph + vectors + sqlite) and the local
+embedding stack @groundfloor/lore 3.16.0 pulls in:
+
+  @huggingface/transformers ............ Apache-2.0   (local embedding runtime)
+  @lancedb/lancedb ..................... Apache-2.0   (vector index — rebuildable)
+  apache-arrow ......................... Apache-2.0
+  surrealdb 2.0.8 ...................... Apache-2.0   (graph/document engine core)
+  @surrealdb/node 3.0.3 ................ Apache-2.0   (embedded graph store —
+                                         replaces the former kuzu-lite)
+  better-sqlite3 ....................... MIT          (sqlite index — rebuildable)
+  @lumis-sh/wasm-sql ................... MIT
+  hono ................................. MIT
+  @hono/node-server .................... MIT
+  yaml ................................. ISC
+  franc ................................ MIT
+  csv-parse ............................ MIT
+  keytar ............................... MIT
+  @modelcontextprotocol/sdk ............ MIT          (lore's own MCP surface)
+
+  surrealdb's own client helpers (@surrealdb/cbor, @surrealdb/sqon) are
+  likewise Apache-2.0.
+
+  Local embedding model weights: the default multilingual e5-small model
+  (intfloat/multilingual-e5-small, redistributed as Xenova/multilingual-e5-small
+  for the transformers.js runtime) is MIT-licensed. Model weights are downloaded
+  at runtime, not vendored in this repository.
+
+  Note (constraint §1.2): surrealdb, LanceDB, and sqlite are REBUILDABLE indexes
+  over the git-synced .atlas/memory.jsonl ledger — not the source of truth. The
+  portability guarantee test (tests/memory-portability.test.ts) proves the
+  ledger alone reconstitutes the knowledge layer, so these native components are
+  disposable at the data level even though their licenses are listed here for
+  redistribution completeness.
+
+--------------------------------------------------------------------------------
+Copyleft disclosure — prebuilt libvips binaries (LGPL-3.0-or-later)
+--------------------------------------------------------------------------------
+
+  sharp (itself Apache-2.0) redistributes prebuilt libvips binaries through
+  its @img/sharp-libvips-* platform packages, which declare LGPL-3.0-or-later;
+  @img/sharp-wasm32 and @img/sharp-win32-* carry an equivalent
+  "Apache-2.0 AND LGPL-3.0-or-later" expression for their embedded libvips.
+  These binaries enter the dependency tree in three places: as a declared
+  optional dependency of the embedded lore (sharp ^0.35.3), and transitively
+  under @huggingface/transformers and @lancedb/lancedb, which each carry their
+  own sharp copy. LGPL-3.0-or-later is a weak copyleft: it covers the libvips
+  binaries themselves, not Atlas's Apache-2.0 code — no Atlas source derives
+  from libvips, and the binaries are installed unmodified from the npm
+  registry rather than vendored in this repository. libvips source is
+  available at https://github.com/libvips/libvips.
+
+================================================================================
+Human-review flags
+================================================================================
+
+  One disclosed copyleft item: the LGPL-3.0-or-later prebuilt libvips binaries
+  described above (via sharp's platform packages). No other production
+  dependency is under a copyleft or unlicensed license as of the last
+  check-license-headers.mjs run — an (MIT OR GPL-3.0-or-later) dual license
+  such as jszip's (optional, via exceljs/mammoth) counts as permissive because
+  the MIT branch is chosen. If a future dependency reports UNKNOWN or a
+  non-permissive SPDX id, that script exits non-zero and the addition must be
+  reviewed by a human before release — do not resolve it unaided.

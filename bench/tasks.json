@@ -1,0 +1,60 @@
+[
+  {
+    "id": "impact-assembleCodeContext",
+    "type": "impact",
+    "symbol": "assembleCodeContext",
+    "question": "What code would break if I change assembleCodeContext?",
+    "rawFiles": [
+      "src/mcp/codeContext.ts",
+      "src/mcp/embeddedReader.ts",
+      "src/mcp/loreReader.ts"
+    ],
+    "expect": [
+      "loadContext",
+      "EmbeddedLoreReader"
+    ],
+    "gold": "assembleCodeContext (src/mcp/codeContext.ts) is called by EmbeddedLoreReader.loadContext (src/mcp/embeddedReader.ts); changing it affects how the code-intelligence read tools (call_graph, blast_radius, find_dead_code, hotspots, layer_violations, schema_drift) assemble their {table, relations} context."
+  },
+  {
+    "id": "callpath-resolveCodeReader",
+    "type": "callpath",
+    "symbol": "resolveCodeReader",
+    "question": "Which functions call resolveCodeReader?",
+    "rawFiles": [
+      "src/mcp/loreReaderFactory.ts",
+      "src/mcp/allTools.ts"
+    ],
+    "expect": [
+      "allTools"
+    ],
+    "gold": "resolveCodeReader (src/mcp/loreReaderFactory.ts) is called by the code-intelligence tool handlers in src/mcp/allTools.ts \u2014 the call_graph, find_dead_code, blast_radius, hotspots, layer_violations, schema_drift, alerts and schema handlers each call it to pick the read transport."
+  },
+  {
+    "id": "impact-EmbeddedLore",
+    "type": "impact",
+    "symbol": "EmbeddedLore",
+    "question": "What breaks if I change the EmbeddedLore class?",
+    "rawFiles": [
+      "src/lore/embeddedLore.ts",
+      "src/mcp/embeddedRegistry.ts",
+      "src/cli.ts"
+    ],
+    "expect": [
+      "getEmbeddedLore",
+      "embeddedRegistry"
+    ],
+    "gold": "EmbeddedLore (src/lore/embeddedLore.ts) is opened by EmbeddedLore.open in the CLI index path (src/cli.ts) and by getEmbeddedLore in the per-workspace registry (src/mcp/embeddedRegistry.ts); the registry is used by the read path (embeddedReader.ts) and the index/knowledge tools in allTools.ts. Changing it affects all embedded reads, writes, supersede, and maintenance."
+  },
+  {
+    "id": "deadcode-scan",
+    "type": "deadcode",
+    "symbol": "",
+    "question": "Which symbols in the codebase are dead (zero inbound references)?",
+    "rawScope": "repo",
+    "rawFiles": [],
+    "expect": [
+      "tectonicMap"
+    ],
+    "gold": "The dead-code set is the symbols with zero inbound references (callable kinds, non-exempt names) in the indexed graph \u2014 e.g. unused analytics helpers such as tectonicMap when nothing imports them. A correct answer enumerates the actual zero-inbound symbols."
+  }
+]

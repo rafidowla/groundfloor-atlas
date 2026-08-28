@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Atlas CLI wrapper — runs the TypeScript entry via tsx when no built
+# dist/ is present (dev path), or the compiled JS otherwise.
+#
+# NODE SELECTION: the native modules (@kineviz/kuzu-lite, better-sqlite3,
+# lancedb, onnxruntime) are compiled for a specific Node ABI — the one the
+# daemon runs. Running the CLI under a DIFFERENT node (e.g. a bare `node` from
+# a shell where nvm defaults to another version) fails direct-embedded-open
+# commands with "NODE_MODULE_VERSION … requires …". So resolve the ABI-matched
+# node (the daemon's) rather than trusting whatever `node` is first on PATH.
+
+set -euo pipefail
+
+# Resolve $0 through symlinks FIRST: `npm link` / global installs invoke this
+# via <npm-prefix>/bin/atlas → …/node_modules/@groundfloor/atlas/bin/atlas, and
+# without this the repo ROOT resolves to the npm prefix (no dist/, no tsx) and
+# every linked invocation dies with "No such file or directory". Loop instead of
+# `readlink -f` — stock macOS readlink has no -f.
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+    SDIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in /*) ;; *) SOURCE="$SDIR/$SOURCE" ;; esac
+done
+HERE="$(cd "$(dirname "$SOURCE")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+
+# Resolve the node whose ABI matches the compiled native modules:
+#   1. $ATLAS_NODE explicit override
+#   2. the node the installed launchd daemon runs (same native modules → same ABI)
+#   3. fall back to bare `node` on PATH (previous behavior)
+resolve_node() {
+    if [ -n "${ATLAS_NODE:-}" ] && [ -x "${ATLAS_NODE}" ]; then
+        printf '%s' "${ATLAS_NODE}"; return
+    fi
+    local plist="$HOME/Library/LaunchAgents/com.groundfloor.atlas.plist"
+    if [ -x /usr/libexec/PlistBuddy ] && [ -f "$plist" ]; then
+        local n
+        n="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null || true)"
+        if [ -n "$n" ] && [ -x "$n" ]; then printf '%s' "$n"; return; fi
+    fi
+    printf 'node'
+}
+
+NODE_BIN="$(resolve_node)"
+# Put the resolved node first on PATH too, so the tsx shim (env-node shebang)
+# and any child processes use the same ABI-matched node.
+if [ "$NODE_BIN" != "node" ]; then
+    export PATH="$(dirname "$NODE_BIN"):$PATH"
+fi
+
+if [ -f "$ROOT/dist/cli.js" ]; then
+    exec "$NODE_BIN" "$ROOT/dist/cli.js" "$@"
+fi
+
+# Fallback to tsx for dev/uncompiled runs — with a legible hint instead of
+# bash's raw "No such file or directory" on a bare clone (no node_modules).
+if [ ! -x "$ROOT/node_modules/.bin/tsx" ]; then
+    echo "atlas: nothing built yet — no dist/cli.js and no node_modules." >&2
+    echo "  Run:  npm install && npm run build   (in $ROOT)" >&2
+    exit 1
+fi
+exec "$ROOT/node_modules/.bin/tsx" "$ROOT/src/cli.ts" "$@"

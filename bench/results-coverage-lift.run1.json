@@ -1,0 +1,110 @@
+{
+  "model": "deepseek/deepseek-v4-flash",
+  "passes": 2,
+  "floorCapChars": 48000,
+  "tasks": [
+    {
+      "id": "impact-assembleCodeContext",
+      "type": "impact",
+      "atlasTool": "atlas_blast_radius",
+      "floorTok": 13537,
+      "atlasTok": 153,
+      "comboTok": 13718,
+      "floorTruncated": false,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": 0,
+          "combo": 60
+        },
+        {
+          "pass": 2,
+          "floor": 90,
+          "combo": 95
+        }
+      ],
+      "meanFloor": 45,
+      "meanCombo": 78,
+      "lift": 33,
+      "deltaTokPct": 1
+    },
+    {
+      "id": "callpath-resolveCodeReader",
+      "type": "callpath",
+      "atlasTool": "atlas_call_graph",
+      "floorTok": 13714,
+      "atlasTok": 249,
+      "comboTok": 13991,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": 70,
+          "combo": 0
+        },
+        {
+          "pass": 2,
+          "floor": null,
+          "combo": 50
+        }
+      ],
+      "meanFloor": 70,
+      "meanCombo": 25,
+      "lift": -45,
+      "deltaTokPct": 2
+    },
+    {
+      "id": "impact-EmbeddedLore",
+      "type": "impact",
+      "atlasTool": "atlas_blast_radius",
+      "floorTok": 13714,
+      "atlasTok": 1108,
+      "comboTok": 14850,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": null,
+          "combo": null
+        },
+        {
+          "pass": 2,
+          "floor": 0,
+          "combo": 85
+        }
+      ],
+      "meanFloor": 0,
+      "meanCombo": 85,
+      "lift": 85,
+      "deltaTokPct": 8
+    },
+    {
+      "id": "deadcode-scan",
+      "type": "deadcode",
+      "atlasTool": "atlas_find_dead_code",
+      "floorTok": 13714,
+      "atlasTok": 3048,
+      "comboTok": 16791,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": 50,
+          "combo": 0
+        },
+        {
+          "pass": 2,
+          "floor": 0,
+          "combo": 75
+        }
+      ],
+      "meanFloor": 25,
+      "meanCombo": 38,
+      "lift": 13,
+      "deltaTokPct": 22
+    }
+  ],
+  "avgFloor": 35,
+  "avgCombo": 56.5,
+  "avgLift": 21.5
+}

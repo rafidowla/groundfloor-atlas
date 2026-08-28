@@ -1,0 +1,39 @@
+node_modules/
+dist/
+dist-bundle/
+release/
+*.log
+# Local index-resume checkpoint state that `atlas index` writes into any
+# indexed repo (per-directory). Never committed — it's machine-local.
+.atlas/
+# EXCEPT the shared team-knowledge export (`atlas hook install`'s pre-commit
+# hook writes + stages this) — that one IS meant to travel with the repo so
+# teammates can `atlas memory import` it after a pull. Everything else under
+# .atlas/ (the checkpoint state above) stays machine-local and ignored.
+!.atlas/memory.jsonl
+.DS_Store
+.env
+.env.local
+atlas-ui/dist/
+atlas-ui/src-tauri/target/
+
+# Benchmark run artifacts
+bench/results.json
+bench/*.prefix-backup.json
+
+# aider repo-map cache (created by the bench aider-map adapter)
+.aider*
+
+# ContextBench dataset (derived from EuniAI/ContextBench — don't vendor)
+bench/datasets/
+.audit-env/
+
+# Local agent/IDE tooling config — machine-specific (settings.json holds
+# absolute hook paths), not shareable as-is.
+.claude/
+.cursor/
+
+# Stray artifacts from an external assessment tool ("ZCode") that ran against
+# this repo — NOT part of the codebase (index.js is a minified bundle of it).
+/index.js
+ZCODE-PROMPT.txt

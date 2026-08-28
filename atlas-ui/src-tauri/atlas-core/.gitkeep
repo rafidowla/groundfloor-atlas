@@ -1,0 +1,3 @@
+Placeholder. `npm run bundle` + the packaging step copy the self-contained
+Atlas core (dist-bundle/) here so `tauri build` ships it as the `atlas-core`
+resource. The directory contents are gitignored (large native binaries).

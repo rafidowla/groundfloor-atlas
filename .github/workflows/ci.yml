@@ -1,0 +1,99 @@
+# ============================================================================
+# .github/workflows/ci.yml — CI for Groundfloor Atlas
+# ============================================================================
+#
+# Runs on every push / PR: the backend (daemon) gate, then the atlas-ui
+# (browser UI, served directly by the daemon — see docs/PACKAGING.md) gate.
+#
+# NOTE: the atlas-ui/src-tauri Tauri desktop app is PARKED (in-tree, not
+# shipped/documented as the product). This pipeline does NOT build or gate
+# Tauri at all — no `tauri build`, no `npm run bundle`. The atlas-ui gate
+# below only builds and tests the plain browser bundle (`vite build` →
+# atlas-ui/dist) that the daemon serves.
+#
+# ── The @groundfloor/lore dependency (read this before touching this file) ──
+#
+# package.json pins:
+#   "@groundfloor/lore": "file:vendor/groundfloor-lore-3.16.0.tgz"
+#
+# The Lore engine is VENDORED into this repo as a committed tarball under
+# vendor/, so a plain `npm ci` on a bare checkout of THIS repo resolves it —
+# no sibling clone, no SSH access keys, no cross-repo operator setup.
+#
+# What IS gated here: `npm run check:license`
+# (scripts/check-license-headers.mjs) reads the vendored tarball's own
+# package.json and asserts its declared license is Elastic-2.0 (the license
+# NOTICE discloses) and its version matches the version in its filename —
+# so a mis-packed or stale tarball fails the backend gate instead of
+# shipping. To bump the engine: build a groundfloor-lore checkout, `npm
+# pack` it, drop the tarball in vendor/ as groundfloor-lore-<version>.tgz,
+# point package.json's dependency at it, and `npm install` to refresh
+# package-lock.json. See docs/PACKAGING.md.
+#
+# ── Node version ──
+# Node 20 — matches this repo's `engines.node: ">=20 <23"` pin (atlas-ui,
+# which has no engines field of its own, gets the same version here).
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — build, guard, test:all (44 MCP tools)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # @groundfloor/lore resolves from the committed vendor/ tarball (see
+      # header) — a bare `npm ci` needs no sibling checkout.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - run: npm run check:versions
+      - run: npm run check:node-abi
+      - run: npm run check:license
+      - run: npm run guard
+      - run: npm run test:all
+
+      # ── Packaging sanity: prove the published tarball actually ships the
+      # built browser UI (atlas-ui/dist), not just the backend. `prepack`
+      # (npm's own pack-time hook) rebuilds the backend + atlas-ui as part
+      # of this, so this also re-validates the atlas-ui build in this job.
+      # See docs/PACKAGING.md.
+      - run: npm pack --dry-run
+
+  atlas-ui:
+    name: atlas-ui — build + vitest (browser UI served by the daemon)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: atlas-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: atlas-ui/package-lock.json
+
+      # atlas-ui does not import @groundfloor/lore — it only talks to the
+      # daemon over HTTP at runtime — so it needs no vendored engine.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - run: npx vitest run

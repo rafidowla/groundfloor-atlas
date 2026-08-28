@@ -1,0 +1,33 @@
+[package]
+name = "atlas-app"
+version = "0.2.8"
+description = "Atlas — Developer Intelligence Desktop App"
+authors = ["Groundfloor"]
+edition = "2021"
+
+[lib]
+name = "atlas_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# NOTE: `shell-open` is a Tauri v1 feature that does not exist in v2 (shell
+# moved to tauri-plugin-shell). Leaving it here made the app uncompilable.
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Already vendored transitively (via tauri → tao); declared directly so we can
+# send SIGTERM before SIGKILL for graceful daemon shutdown (audit RD-F08/R5).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

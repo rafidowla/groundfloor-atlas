@@ -1,0 +1,296 @@
+/**
+ * parser/walkers/_base.ts
+ *
+ * Atlas — Lore developer plugin's tree-sitter code intelligence layer.
+ * Shared walker utilities (cyclomatic complexity, byte-range helpers).
+ *
+ * Original work authored for groundfloor-lore (Apache-2.0 / Unlicense
+ * / MIT dependencies only). License-compliance scan enforced via
+ * `scripts/atlas-license-check.mjs`.
+ *
+ * Phase: 1 (parser foundation).
+ *
+ * These helpers are shared by every per-language walker. They sit at
+ * the layer just above tree-sitter's SyntaxNode but below the
+ * language-specific extraction logic. Anything language-specific
+ * (e.g. "what AST node type is a function in this grammar") lives in
+ * the per-language walker.
+ */
+
+import type { Node } from 'web-tree-sitter';
+import type { ByteRange, ParsedSymbol, SymbolKind } from '../types.js';
+
+/**
+ * Build a ByteRange from a tree-sitter SyntaxNode. Tree-sitter exposes
+ * byte offsets and 0-based row/column natively; we convert rows to
+ * 1-based line numbers (the convention Lore uses everywhere).
+ */
+export function byteRangeFromNode(node: Node): ByteRange {
+    return {
+        start: node.startIndex,
+        end: node.endIndex,
+        startLine: node.startPosition.row + 1,
+        endLine: node.endPosition.row + 1,
+    };
+}
+
+/**
+ * Build the stable id for a ParsedSymbol from its components. Per the
+ * Phase 0 ID-strategy decision: `<file>:<qualifiedName>:<kind>`. This
+ * is the same id format that Phase 7's cutover mapping table uses.
+ *
+ * `file` should be repo-relative with forward slashes (the parser
+ * normalises before reaching here).
+ */
+/**
+ * Slugify the NAME component of a symbol id so the whole id stays inside Lore's
+ * safe-id alphabet (`[A-Za-z0-9 :.\-_/@]`, enforced by assertSafeLanceId — a SQL
+ * predicate-injection control). A raw qualifiedName can carry out-of-alphabet
+ * chars: `{ }`/`[ ]`/`,` from destructuring (`const { where, params } = …`),
+ * `< >` from generics (`Foo<T>`), `[ ]` from computed keys. Left unslugged, Lore
+ * rejects the node write AND every edge that points at it (edge_endpoint_missing),
+ * silently dropping those symbols from the graph. We only touch the name — the
+ * `file` path (`/` `.` `-` already in-alphabet) and the structural `:` delimiters
+ * stay intact. Runs of unsafe chars collapse to a single `_`; edges stay
+ * consistent because the resolver targets the symbol's STORED `.id` (this
+ * output), never a raw rebuild from qualifiedName.
+ */
+export function slugSymbolName(name: string): string {
+    const slug = name
+        .replace(/[^A-Za-z0-9._-]+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    return slug.length > 0 ? slug : '_';
+}
+
+export function buildSymbolId(file: string, qualifiedName: string, kind: SymbolKind): string {
+    return `${file}:${slugSymbolName(qualifiedName)}:${kind}`;
+}
+
+/**
+ * Compute cyclomatic complexity for a tree-sitter subtree.
+ *
+ * Definition: 1 (entry point) + number of decision points encountered
+ * while walking. Decision points are AST nodes whose `type` matches the
+ * caller's `decisionTypes` set — that set is language-specific and
+ * passed in by the walker. Common decision types across languages:
+ * if, else_if, while, for, switch_case, conditional_expression (?:),
+ * logical_and (&&), logical_or (||), catch.
+ *
+ * We don't try to canonicalise across languages here; let each walker
+ * pass the right type names for its grammar. Keeps the walker honest
+ * about its own AST and avoids surprises when a node type rename
+ * happens upstream.
+ */
+export function cyclomaticComplexity(
+    node: Node,
+    decisionTypes: ReadonlySet<string>,
+): number {
+    let count = 1;
+    walkSubtree(node, (n) => {
+        if (decisionTypes.has(n.type)) count += 1;
+    });
+    return count;
+}
+
+/**
+ * Iterate every descendant of `root` (including `root`). Synchronous;
+ * uses an explicit stack so deep ASTs don't blow the JS call stack.
+ *
+ * `skipDescend` (optional): a node matching it is still VISITED but its
+ * children are NOT walked. Used by call extraction to stop at nested
+ * function scopes (see extractCallsInBody).
+ */
+export function walkSubtree(
+    root: Node,
+    visit: (node: Node) => void,
+    skipDescend?: (node: Node) => boolean,
+): void {
+    const stack: Node[] = [root];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node) continue;
+        visit(node);
+        if (skipDescend && skipDescend(node)) continue;
+        for (let i = node.childCount - 1; i >= 0; i--) {
+            const child = node.child(i);
+            if (child) stack.push(child);
+        }
+    }
+}
+
+/**
+ * Count source lines (LOC) excluding empty / whitespace-only lines.
+ * Used by ParsedFile.loc.
+ */
+export function countLoc(source: string): number {
+    let loc = 0;
+    let inLine = false;
+    for (let i = 0; i < source.length; i++) {
+        const ch = source.charCodeAt(i);
+        if (ch === 0x0a /* \n */) {
+            if (inLine) loc += 1;
+            inLine = false;
+        } else if (ch !== 0x20 /* space */ && ch !== 0x09 /* tab */ && ch !== 0x0d /* \r */) {
+            inLine = true;
+        }
+    }
+    if (inLine) loc += 1; // last line without trailing \n
+    return loc;
+}
+
+/**
+ * Slice a substring by byte range from the parsed source.
+ *
+ * Tree-sitter byte offsets are byte-accurate against the original
+ * UTF-8 input. JavaScript strings are UTF-16. We work with UTF-8
+ * buffers throughout the parser to keep offsets honest; this helper
+ * decodes the slice once.
+ */
+export function sliceBytes(sourceUtf8: Uint8Array, range: ByteRange): string {
+    return new TextDecoder('utf-8').decode(sourceUtf8.slice(range.start, range.end));
+}
+
+/**
+ * Build a single-line signature string from a node.
+ *
+ * Most languages give us a useful signature by taking the first line
+ * of the symbol's source text (function declaration line + close-paren).
+ * For multi-line declarations (Python decorators, TS overload chains)
+ * we cap at 200 chars; analytics in Phase 4 don't care about exact
+ * text and the signature is just for display.
+ */
+export function buildSignature(sourceUtf8: Uint8Array, node: Node): string {
+    const text = new TextDecoder('utf-8').decode(
+        sourceUtf8.slice(node.startIndex, node.endIndex),
+    );
+    const firstLine = text.split(/\n/, 1)[0]?.trim() ?? '';
+    return firstLine.length > 200 ? `${firstLine.slice(0, 197)}...` : firstLine;
+}
+
+/**
+ * Helper used by walkers to construct a finished ParsedSymbol from
+ * the per-call extracted fields. Centralises the `parsedAt` timestamp
+ * and id construction so walkers don't duplicate that boilerplate.
+ */
+export function makeParsedSymbol(args: {
+    name: string;
+    qualifiedName: string;
+    kind: SymbolKind;
+    file: string;
+    byteRange: ByteRange;
+    signature: string;
+    complexity: number;
+    parentSymbolId: string | null;
+    parsedAt?: string;
+}): ParsedSymbol {
+    return {
+        id: buildSymbolId(args.file, args.qualifiedName, args.kind),
+        name: args.name,
+        qualifiedName: args.qualifiedName,
+        kind: args.kind,
+        file: args.file,
+        byteRange: args.byteRange,
+        signature: args.signature,
+        complexity: args.complexity,
+        parentSymbolId: args.parentSymbolId,
+        parsedAt: args.parsedAt ?? new Date().toISOString(),
+    };
+}
+
+/**
+ * Per-walker contract: every language's walker module exports a single
+ * `walk` function with this shape. The walker takes the grammar's
+ * SyntaxNode (the file's root) plus the source bytes plus the
+ * repo-relative path, and returns symbols + imports.
+ *
+ * Returning ParsedRelation directly is left as a Phase 2 concern — the
+ * walker focuses on what's extractable from one file's AST without
+ * cross-file resolution. The `contains` relation (parent → child) is
+ * implicit via parentSymbolId chains.
+ */
+export interface WalkerOutput {
+    symbols: ParsedSymbol[];
+    imports: import('../types.js').ParsedImport[];
+    /** Phase 2.1: call sites extracted from function/method bodies. */
+    calls: import('../types.js').ParsedCall[];
+}
+
+export type WalkerFn = (
+    rootNode: Node,
+    sourceUtf8: Uint8Array,
+    file: string,
+) => WalkerOutput;
+
+/**
+ * Phase 2.1 helper: walk every descendant of `bodyNode`, find call
+ * expressions whose `type` is in `callNodeTypes`, and emit a
+ * ParsedCall attributed to `callerSymbolId`.
+ *
+ * `extractCallee` is a per-language strategy function that, given a
+ * call-expression node, returns the callee's textual name and an
+ * optional method-receiver hint. Returns null if the call is dynamic
+ * / not extractable (anonymous arrow, `(getFn())()`, etc.).
+ *
+ * Walkers pass their own `callNodeTypes` set + `extractCallee` strategy
+ * because grammar shapes differ — TS uses `call_expression`, Java uses
+ * `method_invocation`, etc.
+ */
+export function extractCallsInBody(
+    bodyNode: Node,
+    callerSymbolId: string,
+    callNodeTypes: ReadonlySet<string>,
+    extractCallee: (callNode: Node) => { name: string; isMethod: boolean; receiver: string | null } | null,
+    nestedScopeTypes?: ReadonlySet<string>,
+): import('../types.js').ParsedCall[] {
+    const out: import('../types.js').ParsedCall[] = [];
+    // NESTED-SCOPE FIX — without the skip, an outer function's walk descends
+    // into nested function bodies (closures, inner defs, local functions), so
+    // every call inside them is extracted AGAIN when the walker's loop visits
+    // the nested function node — double-counted edges. Skip descending into
+    // nested scope nodes here; the walker's per-function loop extracts those
+    // bodies' calls itself, attributed by innermostContainingSymbol.
+    walkSubtree(bodyNode, (n) => {
+        if (!callNodeTypes.has(n.type)) return;
+        const call = extractCallee(n);
+        if (!call) return;
+        out.push({
+            callerSymbolId,
+            calleeName: call.name,
+            byteRange: byteRangeFromNode(n),
+            isMethodCall: call.isMethod,
+            receiverHint: call.receiver,
+        });
+    }, nestedScopeTypes
+        ? (n) => n !== bodyNode && nestedScopeTypes.has(n.type)
+        : undefined);
+    return out;
+}
+
+/** Kinds that can own a call site: a function or method symbol. */
+export const FUNCTION_METHOD_KINDS: ReadonlySet<SymbolKind> = new Set(['function', 'method']);
+/** Call-owner kinds for walkers whose functions are all methods (Java, C#). */
+export const METHOD_KIND: ReadonlySet<SymbolKind> = new Set(['method']);
+
+/**
+ * The INNERMOST symbol of `kinds` whose byteRange contains `node` — the
+ * correct owner for a call site. The old `symbols.find(contains)` returned
+ * the FIRST match, and walkers push parents before children, so a nested
+ * function's calls were attributed to the OUTERMOST enclosing function.
+ * Smallest containing range = innermost scope.
+ */
+export function innermostContainingSymbol(
+    symbols: ParsedSymbol[],
+    node: Node,
+    kinds: ReadonlySet<SymbolKind>,
+): ParsedSymbol | null {
+    let best: ParsedSymbol | null = null;
+    for (const s of symbols) {
+        if (!kinds.has(s.kind)) continue;
+        if (s.byteRange.start > node.startIndex || s.byteRange.end < node.endIndex) continue;
+        if (!best || (s.byteRange.end - s.byteRange.start) < (best.byteRange.end - best.byteRange.start)) {
+            best = s;
+        }
+    }
+    return best;
+}

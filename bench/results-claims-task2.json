@@ -1,0 +1,137 @@
+{
+  "symbol": "slugSymbolName",
+  "workspace": "groundfloor-atlas",
+  "atlas": {
+    "calls": 1,
+    "tok": 1333,
+    "outChars": 4666
+  },
+  "grepLean": {
+    "calls": 9,
+    "tok": 7065,
+    "steps": [
+      {
+        "call": "grep -rn slugSymbolName src/",
+        "tok": 51
+      },
+      {
+        "call": "read src/parser/walkers/_base.ts (full, 296 lines)",
+        "tok": 3234
+      },
+      {
+        "call": "grep -rnE \"makeParsedSymbol|buildSymbolId\" src/",
+        "tok": 1329
+      },
+      {
+        "call": "grep -rn buildSymbolId src/parser/walkers/graphql.ts (unused-import check)",
+        "tok": 37
+      },
+      {
+        "call": "read ruby.ts:81-133 (verify extractInBody)",
+        "tok": 624
+      },
+      {
+        "call": "read rust.ts:47-73 (verify pushSimple)",
+        "tok": 204
+      },
+      {
+        "call": "read typescript.ts:569-603 (verify extractCjsExports.emit)",
+        "tok": 385
+      },
+      {
+        "call": "read aql.ts:70-113 (verify walk)",
+        "tok": 512
+      },
+      {
+        "call": "read csharp.ts:86-148 (verify extractInBody/visitChild)",
+        "tok": 689
+      }
+    ]
+  },
+  "grepFloor": {
+    "calls": 19,
+    "tok": 46146,
+    "steps": [
+      {
+        "call": "grep -rnl slugSymbolName src/  (1 hit)",
+        "tok": 16
+      },
+      {
+        "call": "read _base.ts (full)",
+        "tok": 3234
+      },
+      {
+        "call": "grep -rnl buildSymbolId src/  (2 hits incl. comment in typescript.ts)",
+        "tok": 26
+      },
+      {
+        "call": "read graphql.ts (full)",
+        "tok": 1634
+      },
+      {
+        "call": "grep -rnl makeParsedSymbol src/  (16 hits)",
+        "tok": 127
+      },
+      {
+        "call": "read aql.ts (full)",
+        "tok": 1363
+      },
+      {
+        "call": "read cpp.ts (full)",
+        "tok": 2556
+      },
+      {
+        "call": "read csharp.ts (full)",
+        "tok": 2730
+      },
+      {
+        "call": "read go.ts (full)",
+        "tok": 2751
+      },
+      {
+        "call": "read java.ts (full)",
+        "tok": 1922
+      },
+      {
+        "call": "read kotlin.ts (full)",
+        "tok": 3813
+      },
+      {
+        "call": "read php.ts (full)",
+        "tok": 3402
+      },
+      {
+        "call": "read prisma.ts (full)",
+        "tok": 925
+      },
+      {
+        "call": "read python.ts (full)",
+        "tok": 2357
+      },
+      {
+        "call": "read ruby.ts (full)",
+        "tok": 2166
+      },
+      {
+        "call": "read rust.ts (full)",
+        "tok": 2489
+      },
+      {
+        "call": "read sql.ts (full)",
+        "tok": 1063
+      },
+      {
+        "call": "read swift.ts (full)",
+        "tok": 3475
+      },
+      {
+        "call": "read typescript.ts (full)",
+        "tok": 10097
+      }
+    ]
+  },
+  "claims": {
+    "gitnexusTokenPct": 74,
+    "gitnexusCallPct": 88
+  }
+}

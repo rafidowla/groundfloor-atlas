@@ -1,0 +1,323 @@
+/**
+ * mcp/embeddedRegistry.ts — process-wide registry of long-lived EmbeddedLore
+ * instances, one per workspace.
+ *
+ * EmbeddedLore.open() constructs kuzu + lancedb + sqlite handles — expensive,
+ * and a single dataDir must not be opened twice concurrently (single-writer
+ * stores contend). So in the daemon BOTH the read tools and the in-process
+ * writer share ONE instance per workspace, opened on first use and closed on
+ * daemon shutdown. The short-lived CLI (`atlas index`) opens its own instead.
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { EmbeddedLore } from '../lore/embeddedLore.js';
+import { loadConfig } from '../config.js';
+
+type AtlasConfig = ReturnType<typeof loadConfig>;
+
+/** dataDir → opening/opened instance. Keyed by dir so two workspaces that
+ *  resolve to the same dir share, and re-opens are coalesced. Map iteration
+ *  order is insertion/refresh order, so it doubles as the LRU queue. */
+const instances = new Map<string, Promise<EmbeddedLore>>();
+
+/** RC #4 — per-instance count of IN-FLIGHT users (tool calls currently reading/
+ *  writing through the instance). LRU eviction must NEVER close an instance with
+ *  a live user: closing native Kuzu/LanceDB handles out from under an in-flight
+ *  read/write crashes the process. Keyed by the SAME dataDir key as `instances`.
+ *  A borrow increments; the matching release decrements. */
+const refCounts = new Map<string, number>();
+
+/** RD-Mregistry — cap concurrently-open embedded instances. Each one holds
+ *  kuzu+lancedb+sqlite handles; an unbounded daemon serving many workspaces
+ *  would leak file descriptors / memory without bound. When the cap is
+ *  exceeded the least-recently-used IDLE instance is closed and evicted. */
+const MAX_OPEN = 10;
+
+/**
+ * RD-Mquarantine — corrupt-store circuit breaker.
+ *
+ * Without this, a dataDir whose kuzu/lancedb/sqlite files are corrupt (disk
+ * corruption, an interrupted write, a bad manual edit) gets its EXPENSIVE
+ * `EmbeddedLore.open()` re-attempted on EVERY tool call forever — the existing
+ * `p.catch(() => instances.delete(dir))` eviction means a failed open is never
+ * cached as a rejection, so nothing short-circuits the retry. For a corrupt
+ * store that open can be slow AND doomed to fail every time, so every tool
+ * call pays the full cost only to fail identically.
+ *
+ * Tracks consecutive open failures per dataDir. After `FAILURE_THRESHOLD`
+ * CONSECUTIVE failures, the dir is quarantined for `COOLDOWN_MS`: further
+ * calls fail FAST with a clear, actionable error instead of re-attempting the
+ * open. After the cooldown elapses, exactly one "probe" open is allowed
+ * (half-open) — success clears the quarantine, failure re-arms it for
+ * another full cooldown. A successful open at ANY point resets the counter to
+ * zero, so a transiently-flaky store (e.g. one interrupted write) recovers
+ * automatically instead of tripping the breaker on unrelated future failures.
+ */
+const FAILURE_THRESHOLD = 3;
+const COOLDOWN_MS = 60_000;
+
+interface FailureState {
+    consecutiveFailures: number;
+    quarantinedUntil: number; // epoch ms; 0 = not quarantined
+    lastError: string;
+}
+
+const failureStates = new Map<string, FailureState>();
+
+/** True while `dir` is quarantined (past threshold, cooldown not yet elapsed). */
+function isQuarantined(dir: string): boolean {
+    const st = failureStates.get(dir);
+    if (!st) return false;
+    return st.consecutiveFailures >= FAILURE_THRESHOLD && Date.now() < st.quarantinedUntil;
+}
+
+function recordOpenSuccess(dir: string): void {
+    failureStates.delete(dir);
+}
+
+function recordOpenFailure(dir: string, err: unknown): void {
+    const msg = (err as Error)?.message ?? String(err);
+    const prev = failureStates.get(dir);
+    const consecutiveFailures = (prev?.consecutiveFailures ?? 0) + 1;
+    const quarantinedUntil = consecutiveFailures >= FAILURE_THRESHOLD ? Date.now() + COOLDOWN_MS : 0;
+    failureStates.set(dir, { consecutiveFailures, quarantinedUntil, lastError: msg });
+}
+
+function quarantineError(dir: string): Error {
+    const st = failureStates.get(dir);
+    const secondsLeft = st ? Math.max(0, Math.ceil((st.quarantinedUntil - Date.now()) / 1000)) : 0;
+    return new Error(
+        `Lore store at ${dir} failed to open ${st?.consecutiveFailures ?? FAILURE_THRESHOLD} times in a row ` +
+        `(last error: ${st?.lastError ?? 'unknown'}) and is temporarily quarantined for ${secondsLeft}s to avoid ` +
+        `retrying an expensive failing open on every call. This usually means the store is corrupt. ` +
+        `Re-index the workspace (\`atlas index <path> --force\`) or remove the store directory and re-index from ` +
+        `scratch if the problem persists.`,
+    );
+}
+
+/** Test-only: reset the quarantine/failure state for a dir (or all dirs). */
+export function _resetFailureStateForTests(dir?: string): void {
+    if (dir) failureStates.delete(dir);
+    else failureStates.clear();
+}
+
+/** Diagnostics: current failure count for a dir (0 if none recorded). */
+export function openFailureCount(dir: string): number {
+    return failureStates.get(dir)?.consecutiveFailures ?? 0;
+}
+
+// Moved to ../projectRegistry.js (pure path math, no native deps) so callers
+// needing only a data-dir path don't drag EmbeddedLore → @groundfloor/lore →
+// kuzu/lancedb/better-sqlite3 in with them. Re-exported here so every existing
+// importer of embeddedBaseDir/embeddedDataDir keeps working unchanged.
+// Imported (so this module's own code can call them) AND re-exported (so every
+// existing `from './embeddedRegistry.js'` import site keeps working unchanged).
+import { embeddedBaseDir, embeddedDataDir } from '../projectRegistry.js';
+export { embeddedBaseDir, embeddedDataDir };
+
+/**
+ * Ensure the lore-data root (or configured dataDir base) exists at 0700.
+ * `lore-data` holds every workspace's full source-code graph — owner-only.
+ * chmod is authoritative (mkdir's mode is umask-subject) and also hardens an
+ * already-existing 0755 dir from before this fix. Best-effort: never crash the
+ * daemon over a mode failure, but log it.
+ */
+export function ensureEmbeddedBaseDir(cfg: AtlasConfig): string {
+    const dir = embeddedBaseDir(cfg);
+    try {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } catch (err) {
+        console.error(`[atlas] warning: failed to create lore-data root (${dir}): ${(err as Error).message}`);
+    }
+    try {
+        fs.chmodSync(dir, 0o700);
+    } catch (err) {
+        console.error(`[atlas] warning: failed to chmod lore-data root (${dir}) to 0700: ${(err as Error).message}`);
+    }
+    return dir;
+}
+
+
+/** Get-or-open the shared EmbeddedLore for a workspace. Concurrent callers
+ *  coalesce on the same open() promise; a failed open is dropped so a later
+ *  call retries instead of pinning the rejection.
+ *
+ *  RD-Mquarantine — a dir with FAILURE_THRESHOLD consecutive failed opens is
+ *  quarantined for a cooldown: calls during that window fail fast with a
+ *  clear, actionable error instead of re-attempting the (expensive, doomed)
+ *  open. See the circuit-breaker block above for the full rationale. */
+export function getEmbeddedLore(cfg: AtlasConfig, workspace: string): Promise<EmbeddedLore> {
+    ensureEmbeddedBaseDir(cfg);
+    const dir = embeddedDataDir(cfg, workspace);
+    let p = instances.get(dir);
+    if (p) {
+        // Refresh recency: move to the end of the Map (most-recently-used).
+        instances.delete(dir);
+        instances.set(dir, p);
+        return p;
+    }
+    if (isQuarantined(dir)) {
+        return Promise.reject(quarantineError(dir));
+    }
+    p = EmbeddedLore.open(dir);
+    p.then(
+        () => recordOpenSuccess(dir),
+        (err) => { instances.delete(dir); refCounts.delete(dir); recordOpenFailure(dir, err); },
+    ).catch(() => { /* the handlers above never throw; belt-and-suspenders only */ });
+    instances.set(dir, p);
+    evictIdleOverCap(dir);
+    return p;
+}
+
+/**
+ * RC #4 — evict least-recently-used IDLE instances over the cap. Iterates the
+ * Map in LRU order (oldest first) and closes only instances with a ZERO ref
+ * count — never one with an in-flight user (that would close native handles
+ * mid-read/write and crash). If every over-cap candidate is busy, we simply run
+ * temporarily over the cap rather than close a live instance; the next
+ * borrow/release or open retries the eviction. `keepDir` (the just-opened
+ * instance) is never chosen.
+ */
+function evictIdleOverCap(keepDir: string): void {
+    if (instances.size <= MAX_OPEN) return;
+    for (const oldestKey of [...instances.keys()]) {
+        if (instances.size <= MAX_OPEN) break;
+        if (oldestKey === keepDir) continue;
+        if ((refCounts.get(oldestKey) ?? 0) > 0) continue; // busy — skip, don't close
+        const victim = instances.get(oldestKey);
+        instances.delete(oldestKey);
+        refCounts.delete(oldestKey);
+        if (victim) {
+            void victim.then((l) => l.close()).catch(() => { /* best-effort close */ });
+        }
+    }
+}
+
+/**
+ * RC #4 — borrow the shared EmbeddedLore for a workspace, marking it in-flight so
+ * LRU eviction can't close it under us. Pairs with a `release()` (call it in a
+ * finally). Returns the opened instance + its release. Concurrent borrows stack:
+ * the instance is safe to evict only when the ref count is back to zero.
+ */
+export async function borrowEmbeddedLore(
+    cfg: AtlasConfig,
+    workspace: string,
+): Promise<{ lore: EmbeddedLore; release: () => void }> {
+    ensureEmbeddedBaseDir(cfg);
+    const dir = embeddedDataDir(cfg, workspace);
+    // Increment BEFORE awaiting open so an eviction racing the open can't pick
+    // this dir (getEmbeddedLore sets instances[dir] synchronously below).
+    refCounts.set(dir, (refCounts.get(dir) ?? 0) + 1);
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        const n = (refCounts.get(dir) ?? 1) - 1;
+        if (n <= 0) refCounts.delete(dir);
+        else refCounts.set(dir, n);
+    };
+    try {
+        const lore = await getEmbeddedLore(cfg, workspace);
+        return { lore, release };
+    } catch (err) {
+        // Open failed — undo the ref so a leaked count can't pin a phantom dir.
+        release();
+        throw err;
+    }
+}
+
+/** RC #4 — in-flight user count for a dataDir (tests / diagnostics). */
+export function inFlightUsers(dir: string): number {
+    return refCounts.get(dir) ?? 0;
+}
+
+/**
+ * RC #4 convenience — borrow, run `fn`, release (even on throw). Prefer this
+ * over raw `getEmbeddedLore` in tool handlers: a raw get leaves the refcount
+ * at 0, so LRU eviction can close native handles out from under the in-flight
+ * query (the crash class RC #4 exists to prevent).
+ */
+export async function withEmbeddedLore<T>(
+    cfg: AtlasConfig,
+    workspace: string,
+    fn: (lore: EmbeddedLore) => Promise<T>,
+): Promise<T> {
+    const { lore, release } = await borrowEmbeddedLore(cfg, workspace);
+    try {
+        return await fn(lore);
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Close + evict the shared instance for ONE workspace (workspace_delete /
+ * workspace_rename). The cached handle keeps Kuzu/LanceDB/SQLite files open —
+ * deleting or renaming the dataDir while it's still cached leaves a GHOST
+ * instance whose later writes go into unlinked files, and re-creating a
+ * workspace of the same name would keep serving the ghost instead of opening
+ * the fresh dir.
+ *
+ * Detaches the cache entry first so no new user can attach to the closing
+ * instance, then waits for in-flight borrows to drain (RC #4: never close
+ * native handles under a live user). If the workspace is still busy when the
+ * drain window expires, the entry is re-attached (so the registry keeps
+ * owning the live handle — orphaning it would let a second open violate the
+ * single-writer rule) and an error is thrown so the caller can retry.
+ * No-op if the workspace was never opened in this process.
+ */
+export async function closeEmbeddedLore(cfg: AtlasConfig, workspace: string): Promise<void> {
+    const dir = embeddedDataDir(cfg, workspace);
+    const p = instances.get(dir);
+    if (!p) return;
+    instances.delete(dir);
+    const deadline = Date.now() + 30_000;
+    while ((refCounts.get(dir) ?? 0) > 0) {
+        if (Date.now() > deadline) {
+            instances.set(dir, p); // keep owning the live handle
+            throw new Error(`workspace '${workspace}' still has in-flight operations — try again in a moment`);
+        }
+        await new Promise((r) => setTimeout(r, 25));
+    }
+    refCounts.delete(dir);
+    await p.then((l) => l.close()).catch(() => { /* best-effort close */ });
+}
+
+/** Close every open instance (daemon graceful shutdown). Best-effort. */
+export async function closeAllEmbedded(): Promise<void> {
+    // RD-F07close — snapshot the handles FIRST, then clear, then await. A close
+    // that throws can no longer leave the registry pointing at a half-closed
+    // instance, and allSettled means one failure doesn't abort the rest.
+    const entries = [...instances.entries()];
+    instances.clear();
+    // DRAIN (RC #4, close-all path) — closeEmbeddedLore waits for in-flight
+    // borrows before closing; the close-ALL path used to clear refCounts and
+    // close immediately, killing native handles under live tool calls during
+    // daemon shutdown (reproduced: a borrowed instance closed mid-call →
+    // `KuzuConnectionPool: pool is closed`). Give outstanding borrows the same
+    // bounded drain window, then close regardless — shutdown can't wait forever.
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+        const busy = entries.some(([dir]) => (refCounts.get(dir) ?? 0) > 0);
+        if (!busy) break;
+        await new Promise((r) => setTimeout(r, 25));
+    }
+    refCounts.clear();
+    await Promise.allSettled(entries.map(([, p]) => p.then((l) => l.close())));
+}
+
+/** True if any embedded instance is currently open (for the maintenance timer). */
+export function hasOpenEmbedded(): boolean {
+    return instances.size > 0;
+}
+
+/** Snapshot of open instances (for the maintenance timer to sweep each).
+ *  Tolerates a still-rejecting cached open promise (which races getEmbeddedLore's
+ *  p.catch eviction): allSettled returns only the successfully-opened instances
+ *  instead of rejecting the whole snapshot — matching closeAllEmbedded above. */
+export async function openEmbeddedInstances(): Promise<EmbeddedLore[]> {
+    const settled = await Promise.allSettled(Array.from(instances.values()));
+    return settled
+        .filter((r): r is PromiseFulfilledResult<EmbeddedLore> => r.status === 'fulfilled')
+        .map((r) => r.value);
+}

@@ -1,0 +1,178 @@
+{
+  "model": "deepseek/deepseek-v4-flash",
+  "passes": 3,
+  "floorCapChars": 48000,
+  "tasks": [
+    {
+      "id": "impact-assembleCodeContext",
+      "type": "impact",
+      "atlasTool": "atlas_blast_radius",
+      "floorTok": 13714,
+      "atlasTok": 153,
+      "comboTok": 13895,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": 0,
+          "combo": null,
+          "floorAnswer": "",
+          "floorGrade": "0",
+          "comboAnswer": "Changing `assembleCodeContext` would break:\n\n- **`EmbeddedLoreReader.loadContext`** (`mcp/embeddedReader.ts`) — it directly calls `assembleCodeContext(symbolNodes, edges)` and returns the assembled result. A signature/return-type change breaks this call; a behavioral change alters every read it serves.\n- **The 6 code-intelligence tools** that consume the `{ table, relations }` it produces — `call_graph`, `find_dead_code`, `blast_radius`, `hotspots`, etc. They depend on its edge filtering and identity handling: rescuing file→symbol `imports` edges (or deadCode false-positives), dropping structural `contains` edges, preserving `file:`-prefixed sources + repo-relative paths (or layerViolations misses), and node-id-based symbol identity (or call-graph resolution failures).\n- Per the module comment, the HTTP `LoreReader` was also supposed to be lifted onto this shared function (byte-for-byte parity), but the `loreReader.ts` code shown still inlines its own reconstruction — so the *visible* direct caller is the embedded reader plus its consumers.",
+          "comboGrade": ""
+        },
+        {
+          "pass": 2,
+          "floor": null,
+          "combo": null,
+          "floorAnswer": "Based on the context, changing `assembleCodeContext` would break:\n\n1. **`EmbeddedLoreReader.loadContext()`** – it calls `assembleCodeContext(symbolNodes, edges)` to produce the `{ table, relations }` result (line: \"const assembled = assembleCodeContext(symbolNodes, edges);\").\n\n2. **`LoreReader`** – while it doesn't directly call `assembleCodeContext`, it manually reconstructs `symbols` and `relations` using the same logic (prefix stripping, `qualifyParentSymbolId`, `inferRelationKind`, dedup with `seen` set, file→symbol import edge rescue). If `assembleCodeContext` changes its semantics, the HTTP path must be kept byte-for-byte identical per the file comment: \"Both transports normalize their raw rows to CodeSymbolNode[] + CodeEdge[] and call assembleCodeContext().\" The HTTP reader bypasses this shared function, so any behavior change in `assembleCodeContext` would create a divergence unless `LoreReader` is updated to match.",
+          "floorGrade": "",
+          "comboAnswer": "Changing `assembleCodeContext` would break `EmbeddedLoreReader.loadContext` in `mcp/embeddedReader.ts`,",
+          "comboGrade": ""
+        },
+        {
+          "pass": 3,
+          "floor": 0,
+          "combo": 100,
+          "floorAnswer": "",
+          "floorGrade": "0",
+          "comboAnswer": "",
+          "comboGrade": "100"
+        }
+      ],
+      "meanFloor": 0,
+      "meanCombo": 100,
+      "lift": 100,
+      "deltaTokPct": 1
+    },
+    {
+      "id": "callpath-resolveCodeReader",
+      "type": "callpath",
+      "atlasTool": "atlas_call_graph",
+      "floorTok": 13714,
+      "atlasTok": 612,
+      "comboTok": 14354,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": null,
+          "combo": null,
+          "floorAnswer": "The handlers for `atlas_call_graph`, `atlas_find_dead_code`, `atlas_blast_radius`, `atlas_schema_drift`, `atlas_layer_violations`, and `atlas_hotspots` call `resolveCodeReader`.",
+          "floorGrade": "",
+          "comboAnswer": "The functions that directly call `resolveCodeReader` are:\n\n- `buildRegistry.atlas_layer_violations`\n- `buildRegistry.atlas_find_dead_code`\n- `buildRegistry.alerts_get`\n- `buildRegistry.atlas_blast_radius`\n- `buildRegistry.atlas_hotspots`\n- `buildRegistry.atlas_schema_drift`\n- `buildRegistry.atlas_call_graph`\n- `buildRegistry.schema_validate`\n\n(All located in `src/mcp/allTools.ts`.)",
+          "comboGrade": ""
+        },
+        {
+          "pass": 2,
+          "floor": null,
+          "combo": 60,
+          "floorAnswer": "Based on the context, `resolveCodeReader` is called in the handlers for these tools:\n\n1. `atlas_call_graph`\n2. `atlas_find_dead_code`\n3. `atlas_blast_radius`\n4. `atlas_schema_drift`\n5. `atlas_layer_violations`\n6. `atlas_hotspots`\n\nEach of these handlers calls `resolveCodeReader()` at the start, checks for an error, then passes the resulting reader to the respective tool runner function.",
+          "floorGrade": "",
+          "comboAnswer": "The functions that call `resolveCodeReader` (d1 direct callers) are:\n\n- `buildRegistry.atlas_layer_violations`\n- `buildRegistry.atlas_find_dead_code`\n- `buildRegistry.alerts_get`\n- `buildRegistry.atlas_blast_radius`\n- `buildRegistry.atlas_hotspots`\n- `buildRegistry.atlas_schema_drift`\n- `buildRegistry.atlas_call_graph`\n- `buildRegistry.schema_validate`",
+          "comboGrade": "60"
+        },
+        {
+          "pass": 3,
+          "floor": 100,
+          "combo": 100,
+          "floorAnswer": "",
+          "floorGrade": "100",
+          "comboAnswer": "The functions that call `resolveCodeReader` are:\n\n- `buildRegistry.atlas_layer_violations`\n- `buildRegistry.atlas_find_dead_code`\n- `buildRegistry.alerts_get`\n- `buildRegistry.atlas_blast_radius`\n- `buildRegistry.atlas_hotspots`\n- `buildRegistry.atlas_schema_drift`\n- `buildRegistry.atlas_call_graph`\n- `buildRegistry.schema_validate`",
+          "comboGrade": "100"
+        }
+      ],
+      "meanFloor": 100,
+      "meanCombo": 80,
+      "lift": -20,
+      "deltaTokPct": 5
+    },
+    {
+      "id": "impact-EmbeddedLore",
+      "type": "impact",
+      "atlasTool": "atlas_blast_radius",
+      "floorTok": 13714,
+      "atlasTok": 674,
+      "comboTok": 14416,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": 0,
+          "combo": 100,
+          "floorAnswer": "Based solely on the provided context, changing the `EmbeddedLore` class could break:\n\n1. **Writes (storeNode, storeEdge, bulkStoreNodes, bulkStoreEdges)** — These are serialized through `_withMaintenanceLock` to prevent corruption from concurrent LanceDB compaction. Changing the lock or the write logic could cause data corruption or row loss.\n\n2. **Edge existence verification** — `_storeEdgeUnlocked` calls `edgeExists` after `addEdge` to detect Lore's silent no-op when endpoints are missing (G-2). Changing this could let missing-edge errors silently inflate edge counts.\n\n3. **Edge list memoization** — `listEdges` caches results behind `_edgeCacheEpoch`. Every write path (`_storeEdgeUnlocked`, `deleteNode`) bumps the epoch. Changing the cache or epoch logic could serve stale edge data to read tools (call_graph, find_dead_code, blast_radius, etc.).\n\n4. **Deployment environment isolation** — `withLocalDeploymentEnv` temporarily unsets `LORE_DEPLOYMENT_MODE` from `process.env`. Changing or removing this could cause in-process MCP calls to fail with `workspace_forbidden` if the user has `LORE_DEPLOYMENT_MODE=cloud` in their shell.\n\n5. **Export/import vector handling** — `getEmbeddings` uses `toPlainVector()` to coerce Arrow Float32Array vectors. Changing this could produce all-NaN vectors that serialize as `[null, ...]` on export.\n\n6. **Distinct projects query** — `distinctProjects` falls back from a Kùzu-specific Cypher query to a full `listNodes()` scan for non-Kùzu engines. Changing this could break the stats snapshot on surreal-backed workspaces.",
+          "floorGrade": "0",
+          "comboAnswer": "Changing the `EmbeddedLore` class would break all downstream callers listed in the blast radius (e.g., `getEmbeddedLore`, `cmdIndex`, `openEmbeddedForMemory`, `borrowEmbeddedLore`, `runCli`, `cmdCodeGraphExport`, `cmdMemoryImport`, `resolveEmbeddedRead`, `cmdGroupLoad`, `cmdMemoryExport`) and any other code that depends on its public methods (`storeNode`, `storeEdge`, `bulkStoreNodes`, `bulkStoreEdges`, `getNode`, `listNodes`, `traverse`, `listEdges`, `distinctProjects`, `getEmbeddings`, etc.) or its conformance to the `L",
+          "comboGrade": "100"
+        },
+        {
+          "pass": 2,
+          "floor": 0,
+          "combo": 80,
+          "floorAnswer": "",
+          "floorGrade": "0",
+          "comboAnswer": "Changing the `EmbeddedLore` class could break any caller that depends on its public interface. Based on the blast radius context, the following functions would be affected:\n\n- `EmbeddedLore.open` (d1)\n- `getEmbeddedLore` (d2)\n- `cmdIndex` (d2)\n- `openEmbeddedForMemory` (d2)\n- `borrowEmbeddedLore` (d3)\n- `runCli",
+          "comboGrade": "80"
+        },
+        {
+          "pass": 3,
+          "floor": 0,
+          "combo": 0,
+          "floorAnswer": "",
+          "floorGrade": "0",
+          "comboAnswer": "Changing the `EmbeddedLore` class would break any caller that depends on its public API (the",
+          "comboGrade": "0"
+        }
+      ],
+      "meanFloor": 0,
+      "meanCombo": 60,
+      "lift": 60,
+      "deltaTokPct": 5
+    },
+    {
+      "id": "deadcode-scan",
+      "type": "deadcode",
+      "atlasTool": "atlas_find_dead_code",
+      "floorTok": 13714,
+      "atlasTok": 3026,
+      "comboTok": 16769,
+      "floorTruncated": true,
+      "passes": [
+        {
+          "pass": 1,
+          "floor": 0,
+          "combo": null,
+          "floorAnswer": "The provided context describes the **algorithm** for detecting dead code (`analytics/deadCode.ts`), but does **not** include the actual symbol table or relation data from any codebase. Therefore, I cannot list which specific symbols are dead — the answer requires executing the function against a concrete `SymbolTable` and `ParsedRelation[]`, which are not given. The context is insufficient to answer the question directly.",
+          "floorGrade": "0",
+          "comboAnswer": "Based on the provided `atlas_find_dead_code` output, **235 symbols** are flagged as potentially dead (zero inbound references). The top-level candidates include:\n\n- `explainNativeAbiError` (src/cli.ts)\n- `runCli` (src/cli.ts)\n- `numFromEnv` (src/store/codeNodes.ts)\n- `lookupInFile` (src/resolver/symbolTable.ts)\n- `lookupByQualifiedName` (src/resolver/symbolTable.ts)\n- `LoreSidecarHandle.isAlive` (src/sidecar/loreSidecar.ts)\n- `LoreSidecarHandle.close` (src/sidecar/loreSide",
+          "comboGrade": ""
+        },
+        {
+          "pass": 2,
+          "floor": 0,
+          "combo": 0,
+          "floorAnswer": "Based solely on the provided code context, I cannot determine which specific symbols are dead because the `deadCode` function is a computation that would need to be *run* against a real symbol table and relation set. The context only contains the *logic* for detecting dead code, not the results of that logic.\n\nHowever, the context provides the exact mechanism by which one could find the answer:\n- The `deadCode` function in `analytics/deadCode.ts` identifies symbols with zero inbound `calls` or `imports` edges.\n- It filters to `callableKinds` (function, method, class).\n- It applies exemptions (entry-point names, test files, nested callables within functions/methods).\n- It returns a `DeadCodeReport` containing the `candidates` (dead symbols) and `stats`.\n\nTo get the actual list of dead symbols, one must execute the function with the current symbol table and relations. The context alone is insufficient to list them.",
+          "floorGrade": "0",
+          "comboAnswer": "",
+          "comboGrade": "0"
+        },
+        {
+          "pass": 3,
+          "floor": 0,
+          "combo": 40,
+          "floorAnswer": "The provided context defines the `deadCode` function in `analytics/deadCode.ts`, which identifies symbols with zero inbound `calls` or `imports` edges, after applying heuristics (entry-point patterns, test files, nested functions). However, the context contains only code and documentation—**no actual symbol table or relation data**. Therefore, it is **impossible to list specific dead symbols** from the given information. To obtain an answer, you would need to run the `deadCode` function against a concrete codebase.",
+          "floorGrade": "0",
+          "comboAnswer": "",
+          "comboGrade": "40"
+        }
+      ],
+      "meanFloor": 0,
+      "meanCombo": 20,
+      "lift": 20,
+      "deltaTokPct": 22
+    }
+  ],
+  "avgFloor": 25,
+  "avgCombo": 65,
+  "avgLift": 40
+}

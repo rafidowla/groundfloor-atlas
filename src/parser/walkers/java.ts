@@ -1,0 +1,197 @@
+/**
+ * parser/walkers/java.ts
+ *
+ * Atlas — Lore developer plugin's tree-sitter code intelligence layer.
+ * Java walker.
+ *
+ * Original work authored for groundfloor-lore (Apache-2.0 / Unlicense
+ * / MIT dependencies only). License-compliance scan enforced via
+ * `scripts/atlas-license-check.mjs`.
+ *
+ * Phase: 1 (parser foundation).
+ *
+ * Extracts: class_declaration, interface_declaration, enum_declaration,
+ * record_declaration, method_declaration, constructor_declaration,
+ * import_declaration, package_declaration.
+ */
+
+import type { Node } from 'web-tree-sitter';
+import type { ParsedCall, ParsedImport, ParsedSymbol, SymbolKind } from '../types.js';
+import {
+    buildSignature,
+    byteRangeFromNode,
+    cyclomaticComplexity,
+    extractCallsInBody,
+    METHOD_KIND,
+    innermostContainingSymbol,
+    makeParsedSymbol,
+    walkSubtree,
+    type WalkerFn,
+} from './_base.js';
+
+const JAVA_DECISION_TYPES: ReadonlySet<string> = new Set([
+    'if_statement',
+    'for_statement',
+    'enhanced_for_statement',
+    'while_statement',
+    'do_statement',
+    'switch_block_statement_group',
+    'switch_label',
+    'catch_clause',
+    'ternary_expression',
+    'binary_expression', // overcounts
+]);
+
+const TYPE_DECL = new Set([
+    'class_declaration',
+    'interface_declaration',
+    'enum_declaration',
+    'record_declaration',
+    'annotation_type_declaration',
+]);
+
+function nameOf(node: Node): string | null {
+    const n = node.childForFieldName('name');
+    return n ? n.text : null;
+}
+
+function kindOfTypeDecl(t: string): SymbolKind {
+    switch (t) {
+        case 'class_declaration':
+        case 'record_declaration':
+            return 'class';
+        case 'interface_declaration':
+            return 'interface';
+        case 'enum_declaration':
+            return 'enum';
+        case 'annotation_type_declaration':
+            return 'decorator';
+        default:
+            return 'class';
+    }
+}
+
+function extractImports(rootNode: Node): ParsedImport[] {
+    const out: ParsedImport[] = [];
+    for (let i = 0; i < rootNode.namedChildCount; i++) {
+        const child = rootNode.namedChild(i);
+        if (!child) continue;
+        if (child.type !== 'import_declaration') continue;
+        // import X.Y.Z; or import X.Y.*;
+        const text = child.text.replace(/^import\s+|;\s*$/g, '').trim();
+        out.push({
+            moduleSpecifier: text,
+            names: text.endsWith('.*') ? ['*'] : [],
+            byteRange: byteRangeFromNode(child),
+        });
+    }
+    return out;
+}
+
+function extractInBody(
+    body: Node,
+    sourceUtf8: Uint8Array,
+    file: string,
+    parentSymbolId: string | null,
+    parentQ: string | null,
+    out: ParsedSymbol[],
+): void {
+    for (let i = 0; i < body.namedChildCount; i++) {
+        const child = body.namedChild(i);
+        if (!child) continue;
+
+        if (TYPE_DECL.has(child.type)) {
+            const name = nameOf(child);
+            if (!name) continue;
+            const kind = kindOfTypeDecl(child.type);
+            const qname = parentQ ? `${parentQ}.${name}` : name;
+            const sym = makeParsedSymbol({
+                name,
+                qualifiedName: qname,
+                kind,
+                file,
+                byteRange: byteRangeFromNode(child),
+                signature: buildSignature(sourceUtf8, child),
+                complexity: 1,
+                parentSymbolId,
+            });
+            out.push(sym);
+            const inner = child.childForFieldName('body');
+            if (inner) extractInBody(inner, sourceUtf8, file, sym.id, qname, out);
+        } else if (child.type === 'method_declaration' || child.type === 'constructor_declaration') {
+            const name = nameOf(child) ?? (child.type === 'constructor_declaration' ? 'constructor' : null);
+            if (!name) continue;
+            const qname = parentQ ? `${parentQ}.${name}` : name;
+            out.push(makeParsedSymbol({
+                name,
+                qualifiedName: qname,
+                kind: 'method',
+                file,
+                byteRange: byteRangeFromNode(child),
+                signature: buildSignature(sourceUtf8, child),
+                complexity: cyclomaticComplexity(child, JAVA_DECISION_TYPES),
+                parentSymbolId,
+            }));
+        }
+    }
+}
+
+export const walk: WalkerFn = (rootNode, sourceUtf8, file) => {
+    const symbols: ParsedSymbol[] = [];
+    extractInBody(rootNode, sourceUtf8, file, null, null, symbols);
+
+    // Phase 2.1: extract calls per method/constructor body. Java call shapes:
+    //   - method_invocation  → foo() or obj.foo() or Class.foo()
+    //   - object_creation_expression  → new Foo()
+    //   - explicit_constructor_invocation  → super(...) / this(...)
+    const calls: ParsedCall[] = [];
+    walkSubtree(rootNode, (node) => {
+        if (node.type !== 'method_declaration' && node.type !== 'constructor_declaration') return;
+        const body = node.childForFieldName('body');
+        if (!body) return;
+        const owner = innermostContainingSymbol(symbols, node, METHOD_KIND);
+        if (!owner) return;
+        calls.push(...extractCallsInBody(body, owner.id, JAVA_CALL_NODE_TYPES, extractJavaCallee, JAVA_SCOPE_TYPES));
+    });
+
+    return { symbols, imports: extractImports(rootNode), calls };
+};
+
+// Function-scope node types the per-function loop below extracts itself —
+// nested bodies are skipped during an OUTER function's call walk so
+// their calls are counted once, under the innermost owner.
+const JAVA_SCOPE_TYPES: ReadonlySet<string> = new Set([
+    'method_declaration',
+    'constructor_declaration'
+]);
+
+const JAVA_CALL_NODE_TYPES: ReadonlySet<string> = new Set([
+    'method_invocation',
+    'object_creation_expression',
+    'explicit_constructor_invocation',
+]);
+
+function extractJavaCallee(node: Node): { name: string; isMethod: boolean; receiver: string | null } | null {
+    if (node.type === 'object_creation_expression') {
+        const type = node.childForFieldName('type');
+        if (type) return { name: type.text, isMethod: false, receiver: null };
+        return null;
+    }
+    if (node.type === 'explicit_constructor_invocation') {
+        // super(...) / this(...). The first child is the keyword.
+        const head = node.namedChild(0);
+        if (head && (head.text === 'super' || head.text === 'this')) {
+            return { name: head.text, isMethod: true, receiver: null };
+        }
+        return null;
+    }
+    // method_invocation: object?.name(args)
+    const name = node.childForFieldName('name');
+    if (!name) return null;
+    const obj = node.childForFieldName('object');
+    return {
+        name: name.text,
+        isMethod: !!obj,
+        receiver: obj?.text ?? null,
+    };
+}

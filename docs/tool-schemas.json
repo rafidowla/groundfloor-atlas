@@ -1,0 +1,1182 @@
+{
+    "atlasVersion": "0.2.8",
+    "toolCount": 47,
+    "tools": [
+        {
+            "name": "alerts_dismiss",
+            "description": "Dismiss an alert by recording a decision node in Lore explaining why it was accepted or ignored. This creates an auditable trail so the same alert is not flagged again without context.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "alertType",
+                    "summary",
+                    "reason"
+                ],
+                "properties": {
+                    "alertType": {
+                        "type": "string",
+                        "enum": [
+                            "dead_code",
+                            "hotspot",
+                            "schema_drift",
+                            "layer_violation"
+                        ],
+                        "description": "The type of alert being dismissed."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "The alert summary (copy from alerts_get output)."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this alert is acceptable or intentional."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "alerts_get",
+            "description": "Gather structured alerts from Atlas analytics: dead code, hotspots, and optionally schema drift. Results are merged into a ranked alerts array with type, severity, summary, and detail. Use to get a single prioritized view of what needs attention in a workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace to scan; defaults to Atlas config."
+                    },
+                    "repoRoot": {
+                        "type": "string",
+                        "description": "Repo root for hotspot churn analysis."
+                    },
+                    "schemaFile": {
+                        "type": "string",
+                        "description": "If provided, schema drift is included in the alerts."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max alerts per category (default 10)."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_blast_radius",
+            "description": "Depth-tiered reachability for a symbol (d1=WILL BREAK, d2=LIKELY, d3=MAY NEED TESTING).",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "symbol"
+                ],
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name, qualified name, or id."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": [
+                            "upstream",
+                            "downstream"
+                        ]
+                    },
+                    "edgeKinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Default [calls, imports]."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_call_graph",
+            "description": "Call graph for a symbol — direct callers (upstream) or callees (downstream), d1/d2/d3 reachability.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "symbol"
+                ],
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name, qualified name, or id."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": [
+                            "upstream",
+                            "downstream"
+                        ],
+                        "description": "Default downstream."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Repo qualifier to disambiguate a symbol that exists in several indexed repos (the ambiguity error names the candidates)."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace; defaults to Atlas config."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_communities",
+            "description": "List communities (codebase neighborhoods) detected in the workspace. Clusters code_file nodes by their call/import relationships and labels each cluster by its dominant directory or symbol root, so an agent asking \"where does X live?\" gets a labeled module instead of a flat function list. Embedded Lore mode only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    },
+                    "minSize": {
+                        "type": "integer",
+                        "description": "Drop communities smaller than this. Default 2."
+                    },
+                    "sampleSize": {
+                        "type": "integer",
+                        "description": "Number of sample files/symbols per community. Default 5."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_find_dead_code",
+            "description": "Symbols with zero inbound references — callable kinds only, entry-point names exempted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Filter to one file."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Cap on candidate count (default 100)."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_fullgraph",
+            "description": "Return the ENTIRE code graph for a workspace (all nodes + induced edges) for a whole-workspace visualization. Capped at maxNodes (default 3000, hard-clamped to <= 8000); folders/files/knowledge survive the cap before symbols. Use atlas_subgraph instead for a focused N-hop slice.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    },
+                    "nodeTypes": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Only include nodes of these Lore types (e.g. [\"code_file\",\"code_folder\"]). Default: all structural + knowledge types."
+                    },
+                    "maxNodes": {
+                        "type": "integer",
+                        "description": "Node cap. Default 3000, hard-clamped to <= 8000."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_health",
+            "description": "Liveness check for the Atlas daemon. Returns status, version, uptime_ms.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "atlas_hotspots",
+            "description": "High-complexity (+ optionally high-churn) symbols ranked by risk. Falls back to complexity-only without repoRoot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer"
+                    },
+                    "minComplexity": {
+                        "type": "integer"
+                    },
+                    "churnSinceDays": {
+                        "type": "integer"
+                    },
+                    "repoRoot": {
+                        "type": "string",
+                        "description": "Repo root for git churn lookup."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_index",
+            "description": "Re-index a file or directory: parse → resolve → write code_file and code_symbol nodes + call edges into Lore. Directories are INCREMENTAL by default (resume): files unchanged per the walk root's .atlas/index-state.json still feed cross-file resolution but are not re-written. Single-file runs resolve cross-file edges against the persisted workspace graph and reconcile that file's stale nodes (renamed/removed symbols). embed:false on all code nodes.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "path"
+                ],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or repo-relative path to file or directory."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    },
+                    "resume": {
+                        "type": "boolean",
+                        "description": "Directories only. Default true (incremental — skip unchanged files). false forces a full re-write plus stale-node reconcile."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_layer_violations",
+            "description": "Edges that violate user-declared LayerSpec rules (e.g., ui→core OK, ui⇏plugins).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "layerSpec": {
+                        "description": "Override of the default LayerSpec."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_onboard",
+            "description": "Onboard a project in ONE call — replaces the workspace_create → workspace_add_project → atlas_index → atlas_wire sequence. Derives the workspace from the repo folder slug (reusing an existing matching workspace), detects a stale/wrong-path .atlas/index-state.json and forces a full re-index when found, fires indexing as a BACKGROUND job (returns immediately with a jobId — poll index_status; a large repo can take tens of minutes and that is expected), then installs the wire harness (hooks, CLAUDE.md + AGENTS.md standing instructions, git memory-sync). Returns one summary: workspace, what was installed, jobId, and any stale-index warning. Pass wait:true to block for terminal counts instead.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "path"
+                ],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or repo-relative path to the project directory."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Workspace override (slug: lowercase letters, numbers, hyphens). Default: derived from the repo folder slug; an existing workspace of that name is reused."
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": "Default false = fire-and-forget (returns a jobId; poll index_status). true = block until the index finishes and include terminal files/symbols/edges + skipped-files counts in the summary."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_processes",
+            "description": "Trace execution flow from an entry symbol downstream through call edges. Returns ordered steps with depth + terminal markers.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "entry"
+                ],
+                "properties": {
+                    "entry": {
+                        "type": "string",
+                        "description": "Symbol name (e.g. \"mount\"), qualified suffix (e.g. \"Foo.bar\"), or full code-symbol id."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    },
+                    "maxDepth": {
+                        "type": "integer",
+                        "description": "Cap traversal depth. Default 8."
+                    },
+                    "maxSteps": {
+                        "type": "integer",
+                        "description": "Cap total steps returned. Default 200."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_schema_drift",
+            "description": "Compare a live-DB schema dump (pg_dump/mysqldump/prisma) against declared schema files (.sql/.prisma/.graphql). File-based; no DB connection needed.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "schemaFile"
+                ],
+                "properties": {
+                    "schemaFile": {
+                        "type": "string",
+                        "description": "Path to the live dump file."
+                    },
+                    "declaredFiles": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Explicit list of declared files; defaults to discovery."
+                    },
+                    "repoRoot": {
+                        "type": "string",
+                        "description": "Repo root for relative paths (defaults to cwd)."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_source",
+            "description": "Read a source-line slice for a file the code graph knows about — for the inspector's inline code view. Path is repo-relative (as in code_file.label / SubgraphNode.file). Resolves ONLY against registered repo roots and refuses any path that escapes a root (traversal / absolute / symlink). Returns the requested lines plus a small context margin and the file's total line count.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "path"
+                ],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative file path (as in code_file.label / SubgraphNode.file)."
+                    },
+                    "startLine": {
+                        "type": "integer",
+                        "description": "1-based first line of the slice. Omit for the whole file."
+                    },
+                    "endLine": {
+                        "type": "integer",
+                        "description": "1-based last line of the slice."
+                    },
+                    "contextMargin": {
+                        "type": "integer",
+                        "description": "Extra lines above/below the slice. Default 5."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Repo name (from the registry) to resolve against directly, if known."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_subgraph",
+            "description": "Return a bounded N-hop slice of the code graph around a center node or community, for visualization.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    },
+                    "center": {
+                        "type": "string",
+                        "description": "Node id (code-file:… | code-symbol:…) to BFS from. Provide this OR community, not both."
+                    },
+                    "community": {
+                        "type": "string",
+                        "description": "Community id (from atlas_communities) to expand — all its files seed the BFS. Content-stable across re-index (e.g. \"locale~format\"). Provide this OR center, not both."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Traversal depth cap. Default 2."
+                    },
+                    "nodeTypes": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Only include nodes of these types (e.g. [\"code_file\",\"code_symbol\"]). Applied during BFS."
+                    },
+                    "maxNodes": {
+                        "type": "integer",
+                        "description": "Node cap. Default 200, hard-clamped to <= 1000."
+                    }
+                }
+            }
+        },
+        {
+            "name": "atlas_wire",
+            "description": "Install the auto-consultation harness (Claude Code hooks + CLAUDE.md standing-instructions block + atlas-* skills + git knowledge-sync) into a project directory, so a coding agent is automatically consulted through Atlas instead of only being able to call it. Lets a UI (e.g. the onboarding flow) trigger the same wiring `atlas wire install` does from the CLI.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "project"
+                ],
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Absolute path to the project directory to wire."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace to bind the harness to. Defaults to the repo slug (or the folder name) when omitted."
+                    }
+                }
+            }
+        },
+        {
+            "name": "cloud_sync_config_get",
+            "description": "Return the current cloud sync configuration. Shows enabled status, sync direction, and cloud endpoint URL. Does NOT return the raw API key (only whether one is set).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "cloud_sync_config_set",
+            "description": "Persist cloud sync configuration to Atlas config.json. When enabled, Atlas can route Lore MCP calls to the cloud Groundfloor endpoint for multi-device and multi-user sync.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "enabled",
+                    "cloudMcpUrl",
+                    "syncDirection"
+                ],
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Whether to enable cloud sync."
+                    },
+                    "cloudMcpUrl": {
+                        "type": "string",
+                        "description": "Cloud Lore MCP endpoint URL (e.g. https://api.groundfloor.io/lore/mcp)."
+                    },
+                    "apiKey": {
+                        "type": "string",
+                        "description": "Cloud API key (Groundfloor account token)."
+                    },
+                    "syncDirection": {
+                        "type": "string",
+                        "enum": [
+                            "push",
+                            "pull",
+                            "bidirectional"
+                        ],
+                        "description": "push=local→cloud, pull=cloud→local merge, bidirectional=both."
+                    }
+                }
+            }
+        },
+        {
+            "name": "flag_unbacked_work",
+            "description": "Read-only developer-side flag reader: list work (decisions) in a workspace that has NO approved PM change request behind it — neither PM-authored nor edge-linked to an approved, non-superseded PM decision. FLAG, NEVER BLOCK. Project-level only; never per-person. Powers the Groundfloor Atlas UI \"unbacked work\" panel and mirrors the `atlas memory flag` CLI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    },
+                    "includeSuperseded": {
+                        "type": "boolean",
+                        "description": "Include soft-superseded work nodes. Default false."
+                    }
+                }
+            }
+        },
+        {
+            "name": "index_status",
+            "description": "Live progress of an in-flight atlas_index/atlas_onboard run for a workspace. Pollable + non-blocking — poll ~1s while a run is active. Returns {indexing, phase, filesDone, filesTotal, nodesWritten, edgesWritten, jobId?, skippedFiles?}. indexing===true means a run is in flight (independent of which client triggered it); phase is idle|parsing|writing|done|error. jobId correlates a fire-and-forget atlas_onboard run. skippedFiles reports files the parser deliberately skipped, with reasons ({count, byReason, sample}). Code nodes are embed:false so there is NO embedding bar; embedsPending appears only when the context layer is on, with no fabricated total.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_delete",
+            "description": "Hard-delete a knowledge node by id: removes it and all its edges from the graph and purges its vector/text row so it no longer surfaces in recall. Unlike knowledge_supersede (a reversible soft-tombstone that keeps history), this is permanent — use it only to purge stray/test nodes that should never have existed, not to record that a decision changed (use supersede for that). Returns { ok, deleted }; deleted:false means the id was already absent.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "id",
+                    "workspace"
+                ],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "ID of the node to delete outright."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_export_all",
+            "description": "Export every knowledge node + edge in a workspace to a JSONL file, for the daemon to write directly (in-process, using its already-open Lore handle). Exists so a SEPARATE CLI process (e.g. the `atlas hook install` pre-commit hook, or `atlas memory export`) never has to open its own competing Kuzu connection when the daemon is already running — Kuzu is single-writer, so a second process opening the same workspace while the daemon holds it fails with a lock error. Callers should try this over the daemon's /mcp endpoint first and only fall back to a direct embedded open when the daemon is unreachable.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "outPath"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string"
+                    },
+                    "outPath": {
+                        "type": "string",
+                        "description": "Absolute path to write the JSONL export to (the daemon's cwd differs from the caller's, so this must be absolute, not project-relative)."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_import_all",
+            "description": "Import a JSONL knowledge export into a workspace, for the daemon to do in-process (using its already-open Lore handle). Mirrors knowledge_export_all's reason for existing: a SEPARATE CLI process (e.g. the `atlas wire`-installed post-merge/post-checkout git hook, or `atlas memory import`) must not open its own competing Kuzu connection when the daemon already has this workspace open.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "inPath"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string"
+                    },
+                    "inPath": {
+                        "type": "string",
+                        "description": "Absolute path to the JSONL file to import (the daemon's cwd differs from the caller's, so this must be absolute, not project-relative)."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_list",
+            "description": "COMPLETE, deterministic list of the knowledge nodes in a workspace — the \"show me every standing rule for this project\" call. Unlike knowledge_recall (semantic, ranked, relevance-capped) and knowledge_search (requires a non-empty query), this enumerates everything of the requested type with no ranking and no similarity cut-off. Ordered by id so offset/limit paging stays stable while other writes land; `total` counts all matches before paging. Superseded/retracted nodes are hidden unless includeSuperseded is set — when included they carry supersededBy, and a supersededBy of \"knowledge:tombstone:<workspace>\" means the node was RETRACTED (withdrawn as wrong) rather than replaced. Returns truncated:true if a pathological workspace exceeds the raw pull cap, in which case `total` is a LOWER BOUND — a partial list is never presented as complete.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace name."
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "decision",
+                            "convention",
+                            "bug_pattern",
+                            "troubleshooting",
+                            "architecture"
+                        ],
+                        "description": "Restrict to one knowledge type. Omit for all knowledge types. Code nodes (code_file/code_symbol) are deliberately not listable here — use atlas_subgraph / atlas_fullgraph for the code graph."
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Keep only nodes carrying this exact tag (case-insensitive)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Page size. Default 50, max 500."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Rows to skip, for paging. Default 0."
+                    },
+                    "includeSuperseded": {
+                        "type": "boolean",
+                        "description": "Include superseded/retracted nodes (they carry supersededAt/supersededBy/supersededReason). Default false."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_recall",
+            "description": "Semantic recall — find knowledge nodes relevant to a topic using vector similarity search. Use before starting any task to retrieve existing decisions, conventions, and bug patterns. Proxies to Lore GET /api/recall. Single-project by default. For cross-project recall, co-load repos with `atlas group load` and recall against the combined store.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "topic"
+                ],
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Free-text topic to recall against (e.g. \"auth token rotation\", \"database migration strategy\")."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace. Defaults to Atlas config workspace."
+                    },
+                    "max": {
+                        "type": "integer",
+                        "description": "Max results to return. Default 10."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": [
+                            "summary",
+                            "full"
+                        ],
+                        "description": "summary=titles+snippets only, full=complete node content. Default summary."
+                    },
+                    "includeSuperseded": {
+                        "type": "boolean",
+                        "description": "Include soft-deleted (superseded) nodes. Default false."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_retract",
+            "description": "Soft-retract a knowledge node WITHOUT a replacement — the \"this is wrong, forget it\" path. The node stays in the graph with its history and edges intact, is hidden from default recall, and remains visible via includeSuperseded, exactly like a superseded node. Use this instead of knowledge_delete (permanent) whenever the intent is \"stop telling me this\", and instead of knowledge_supersede when there is nothing to supersede it WITH. Implemented by superseding the node to a per-workspace tombstone that Atlas creates on demand; callers never invent a placeholder node of their own.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "id",
+                    "workspace"
+                ],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "ID of the node to retract."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why it is being retracted. Recorded on the supersession — strongly recommended, since a retraction with no reason is indistinguishable from a mistake later."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_search",
+            "description": "Full-text search across knowledge nodes in Lore. Use when you know a specific term or ID rather than a semantic topic. Proxies to Lore GET /api/search.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "q"
+                ],
+                "properties": {
+                    "q": {
+                        "type": "string",
+                        "description": "Search query string."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results. Default 20."
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "decision",
+                            "convention",
+                            "bug_pattern",
+                            "troubleshooting",
+                            "architecture",
+                            "code_symbol",
+                            "code_file"
+                        ],
+                        "description": "Filter to a specific node type."
+                    },
+                    "search_mode": {
+                        "type": "string",
+                        "enum": [
+                            "keyword",
+                            "semantic",
+                            "hybrid"
+                        ],
+                        "description": "Search mode (default: hybrid). keyword=Kùzu CONTAINS literal match; semantic=LanceDB vector similarity; hybrid=both fused."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_store",
+            "description": "Store a semantic knowledge node (decision, convention, bug_pattern, troubleshooting, or architecture) into Lore with embedding enabled. Use this when an AI agent or developer captures institutional knowledge. Atlas proxies to Lore with embed:true.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "type",
+                    "label",
+                    "content",
+                    "workspace"
+                ],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Optional stable ID. Auto-generated if omitted."
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "decision",
+                            "convention",
+                            "bug_pattern",
+                            "troubleshooting",
+                            "architecture"
+                        ],
+                        "description": "Node type. decision=architectural choices, convention=naming/coding rules, bug_pattern=recurring bugs+fix, troubleshooting=recovery steps, architecture=high-level design."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable title."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full text content — the WHY, not just the WHAT. This is what gets embedded for semantic recall."
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "Comma-separated tags for discoverability (e.g. \"auth,security,jwt\")."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace name."
+                    },
+                    "metadata": {
+                        "type": "string",
+                        "description": "Optional JSON string with extra structured fields."
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_store_edge",
+            "description": "Store an edge (relationship) between two knowledge nodes in Lore. Use to link a bug_pattern to a decision, or a convention to an architecture node.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "sourceId",
+                    "targetId",
+                    "relation",
+                    "workspace"
+                ],
+                "properties": {
+                    "sourceId": {
+                        "type": "string",
+                        "description": "ID of the source node."
+                    },
+                    "targetId": {
+                        "type": "string",
+                        "description": "ID of the target node."
+                    },
+                    "relation": {
+                        "type": "string",
+                        "description": "Edge relation label (e.g. \"related_to\", \"caused_by\", \"resolves\", \"supersedes\")."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "knowledge_supersede",
+            "description": "Soft-supersede an old knowledge node with a newer one. The old node stays in the graph (edges preserved, history intact) but is hidden from default recall. Use when a decision or architecture changes and you want a clear \"this was before, this is now\" trail. When there is NO replacement — \"this is just wrong, forget it\" — use knowledge_retract instead of inventing a placeholder node.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "oldId",
+                    "newId",
+                    "workspace"
+                ],
+                "properties": {
+                    "oldId": {
+                        "type": "string",
+                        "description": "ID of the node being superseded."
+                    },
+                    "newId": {
+                        "type": "string",
+                        "description": "ID of the new node that replaces it."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional human-readable reason for the supersession."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "llm_chat",
+            "description": "Send a query to the configured LLM (Ollama, OpenAI, or Anthropic) with optional Atlas tool context. The LLM synthesises the context into a clear, actionable insight. Returns passthrough when provider=none.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "query"
+                ],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The developer's question or task."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Raw Atlas tool result (JSON string or plain text) to include as context for the LLM."
+                    },
+                    "toolLabel": {
+                        "type": "string",
+                        "description": "Human-readable name of the Atlas tool that produced the context (e.g. \"knowledge_recall\")."
+                    }
+                }
+            }
+        },
+        {
+            "name": "llm_config_get",
+            "description": "Return the current LLM configuration for the Atlas daemon. Shows provider and model; does NOT return the raw API key (only whether one is set).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "llm_config_set",
+            "description": "Persist LLM provider configuration to Atlas config.json. Existing config fields (port, lore, sidecar) are preserved; only the llm section is updated.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "provider",
+                    "model"
+                ],
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "enum": [
+                            "ollama",
+                            "openai",
+                            "anthropic",
+                            "none"
+                        ],
+                        "description": "LLM provider. Use \"none\" to disable LLM synthesis."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name (e.g. \"llama3.2\", \"gpt-4o-mini\", \"claude-haiku-4-5\")."
+                    },
+                    "apiKey": {
+                        "type": "string",
+                        "description": "API key for OpenAI or Anthropic. Omit or leave empty for Ollama / none."
+                    },
+                    "ollamaUrl": {
+                        "type": "string",
+                        "description": "Base URL for local Ollama. Default: http://localhost:11434"
+                    },
+                    "allowCloudContext": {
+                        "type": "boolean",
+                        "description": "Consent to send recalled repo/knowledge context to a CLOUD provider (OpenAI/Anthropic). Default false = context withheld. Sent context is always secret+PII-redacted regardless. Omit to leave the current setting unchanged."
+                    }
+                }
+            }
+        },
+        {
+            "name": "schema_confirm",
+            "description": "Confirm a schema change by writing a decision knowledge node to Lore. Records the schema change, the file affected, and the rationale so future engineers can recall why the migration was made.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "label",
+                    "content",
+                    "schemaFile"
+                ],
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Short title for the decision (e.g. \"Add user_sessions table\")."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full rationale — the WHY. Include trade-offs considered and migration plan."
+                    },
+                    "schemaFile": {
+                        "type": "string",
+                        "description": "Path to the schema file this decision applies to."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "schema_validate",
+            "description": "Run schema drift analysis and blast-radius impact assessment for a schema change. Takes a schema file and optional repo root; returns a combined {drift, impact} object. Use before applying a migration to understand what breaks.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "schemaFile"
+                ],
+                "properties": {
+                    "schemaFile": {
+                        "type": "string",
+                        "description": "Path to the live dump / modified schema file."
+                    },
+                    "repoRoot": {
+                        "type": "string",
+                        "description": "Repo root for file discovery and blast-radius traversal. Defaults to cwd."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Schema symbol to assess blast radius for (e.g. a table name or type). Required for impact analysis."
+                    },
+                    "workspace": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        {
+            "name": "verbatim_import",
+            "description": "Import files as verbatim entries (one per file, queued like verbatim_store). Every path is checked against the operator scan allowlist (the same one atlas_index enforces) BEFORE anything is read; a forbidden path rejects the whole call with a typed error. Timestamp = the first ISO-8601 date found in the file's first 20 lines, else the file mtime. Source = \"doc:<absolute path>\".",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "files"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace to store the entries in."
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "File paths to import verbatim."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional topic stamped on every imported entry."
+                    }
+                }
+            }
+        },
+        {
+            "name": "verbatim_recall",
+            "description": "Recall verbatim entries for a topic (semantic recall narrowed to verbatim-tagged nodes). Each hit is annotated with its standing against the rest of the result set: \"superseded-by:<id>\" when a newer hit supersedes it via a supersedes edge, \"outdated-by:<id> (by time)\" when a co-topic hit is strictly newer, else \"current\". Current hits lead (newest first), the rest follow by timestamp descending. Append-only: this tool never mutates stored entries.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "topic"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace to recall from."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Free-text topic to recall against (e.g. \"auth token rotation discussion\")."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max entries to return. Default 10."
+                    }
+                }
+            }
+        },
+        {
+            "name": "verbatim_store",
+            "description": "Queue a verbatim memory entry — raw, unmodified text (agent turn, doc excerpt, transcript quote) stored append-only under a deterministic id (sha256 of the text), so re-storing identical text is an idempotent upsert, never a duplicate. Content layout: \"SOURCE:\" and \"AT:\" header lines, then the byte-exact text (32KB cap; over-cap text is tail-truncated with a [truncated] marker). Returns {ok, queued, id} immediately — the write lands via a background bulk flush. These nodes are never edited or deleted by the verbatim tools; use knowledge_supersede semantics via knowledge_store_edge to mark one superseded.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "text",
+                    "source"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Lore workspace to store the entry in."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Raw text to preserve verbatim. Stored unmodified after the header lines (32KB cap)."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where the text came from, e.g. \"session:<id>\" or \"doc:/absolute/path\"."
+                    },
+                    "timestamp": {
+                        "type": "string",
+                        "description": "ISO-8601 capture time. Default: now."
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional topic; entries sharing a topic tag are time-compared in verbatim_recall."
+                    },
+                    "sessionId": {
+                        "type": "string",
+                        "description": "Optional session id, kept in node metadata."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_add_project",
+            "description": "Register an absolute project folder path in a Lore workspace. Indexing is triggered separately via atlas_index. Call this once per project root you want Atlas to track.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "path"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Target workspace name."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the project folder."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_create",
+            "description": "Create a new Lore workspace of type code_intelligence. Returns the new workspace ID. Use this once before indexing a project for the first time.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "name"
+                ],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Workspace name (slug-style, e.g. \"my-project\")."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_delete",
+            "description": "Permanently delete a Lore workspace and all its indexed data. This is irreversible. A knowledge snapshot is taken automatically before deletion (see knowledgeBackupPath in the response) — restore it with `atlas memory import <path>` into a fresh workspace if the delete turns out to be a mistake.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Workspace name to delete."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_list",
+            "description": "List all Lore workspaces accessible with the current auth token. Pass includeStats:true (embedded mode) to also return per-workspace KPIs (node/edge counts, type breakdown, projects, lastIndexed) read cheaply from each workspace's stats.json snapshot — this never opens a Kuzu store.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeStats": {
+                        "type": "boolean",
+                        "description": "Embedded mode only: also return per-workspace KPIs from each workspace's stats.json snapshot (falls back to the kuzu graph mtime for lastIndexed when no snapshot exists). Default false returns bare names."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_list_projects",
+            "description": "List all project folders registered in a workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Workspace name."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_remove_project",
+            "description": "Remove a project folder from a workspace registry. Does not delete indexed data from the graph.",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "path"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Workspace name."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path of the project to remove."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_rename",
+            "description": "Rename a Lore workspace. The new name must be a valid slug (lowercase letters, numbers, hyphens).",
+            "inputSchema": {
+                "type": "object",
+                "required": [
+                    "workspace",
+                    "newName"
+                ],
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Current workspace name."
+                    },
+                    "newName": {
+                        "type": "string",
+                        "description": "New workspace name (slug-style, e.g. \"my-project\")."
+                    }
+                }
+            }
+        },
+        {
+            "name": "workspace_status",
+            "description": "Get the health and statistics for a Lore workspace: node counts, last indexed timestamp, and indexer health.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Workspace name. Defaults to Atlas config workspace."
+                    }
+                }
+            }
+        }
+    ]
+}

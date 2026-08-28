@@ -1,0 +1,21 @@
+# This file exists ONLY to make `npm pack`/`npm publish` at the repo root
+# ship atlas-ui/dist/ (the built browser UI) inside the published tarball.
+#
+# Why: atlas-ui/.gitignore lists `dist` (correct — it's a build artifact and
+# must never be committed to git). But npm's packlist walk consults nested
+# .gitignore files in subdirectories even when the parent path is explicitly
+# whitelisted via the root package.json `files` array — so without this file,
+# the root `files: ["atlas-ui/dist/", ...]` entry was silently dropped and
+# the tarball shipped NO atlas-ui files at all (verified via `npm pack
+# --dry-run --json`).
+#
+# An .npmignore present in a directory fully overrides .gitignore for THAT
+# directory during packing (npm's own documented rule), without touching git
+# tracking. This file is intentionally near-empty: it doesn't ignore
+# node_modules/src-tauri/etc. itself because the root `files` whitelist
+# already limits what's considered in the first place — this file's only
+# job is to stop atlas-ui/.gitignore's `dist` line from also applying here.
+#
+# Do NOT delete this file — atlas-ui/dist shipping in the package is required
+# for `atlas serve` to have a UI after a plain `npm install` (see
+# docs/PACKAGING.md).

@@ -13,11 +13,11 @@ AI coding agent over MCP.
 
 ![Groundfloor Atlas terminal demo](docs/terminal-demo.gif)
 
-*Live: an AI coding agent asking Atlas a structural question instead of
-grepping — one real `atlas_blast_radius` call, then the measured result from
-`bench/claims-task2.mjs`: 81–97% fewer tokens and 89–95% fewer tool calls
-than grep-based exploration. The blast-radius projection shown is
-reproducible via `bench/demo-blast.mjs`.*
+*Live: an AI coding agent asks Atlas a structural impact question instead of
+grepping — one `atlas_blast_radius` call, 1,333 tokens, versus the grep-based
+alternative: 9 tool calls, 7,065 tokens (19 calls, 46,146 tokens for the
+read-every-hit-file version). Reproducible via `bench/demo-blast.mjs` and
+`bench/claims-task2.mjs`.*
 
 ## Quick start (CLI + browser UI)
 

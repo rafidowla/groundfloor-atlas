@@ -88,6 +88,21 @@ function reRankByType<T extends { type?: string }>(hits: T[]): T[] {
  *  lean; `mode:'full'` returns the complete content instead. */
 const RECALL_SNIPPET_CHARS = 280;
 
+/** Bound on how long close() waits for the maintenance lock before giving up
+ *  on a clean dispose for THIS workspace (shutdown-wedge guard, RD-F13-adjacent).
+ *  Distinct from runMaintenance's 120s loopback bound on purpose: that cap is
+ *  the MCP CLIENT's patience with a slow-but-healthy compaction — it says
+ *  nothing about when the lock actually frees, because the server-side
+ *  compaction keeps running after the client gives up and the write paths
+ *  (storeNode/storeEdge/bulks/supersede/deleteNode) hold the same lock with
+ *  NO bound at all on their native calls. If any of those wedges natively,
+ *  close()'s unbounded lock wait hangs the whole daemon shutdown forever.
+ *  60s = 2× the fold's 30s patience window and above both 30s registry drain
+ *  windows, so a healthy-but-slow holder is very likely to have settled;
+ *  past it, "the daemon actually restarts" outranks "this one workspace's
+ *  shutdown was pristine" (see close()). */
+export const CLOSE_LOCK_TIMEOUT_MS = 60_000;
+
 /** Non-destructively truncate a hit's `content` to a snippet for summary mode.
  *  Returns a copy; the original hit object is never mutated. */
 function snippetHit<T extends { content?: string | null }>(h: T): T {
@@ -157,16 +172,55 @@ export class EmbeddedLore implements LoreWriter {
         this._edgeCache = null;
     }
 
-    /** Run `fn` with exclusive access against any other lock holder. */
-    private async _withMaintenanceLock<T>(fn: () => Promise<T>): Promise<T> {
+    /** Run `fn` with exclusive access against any other lock holder.
+     *
+     *  `acquireTimeoutMs` bounds ONLY the wait for prior holders to release —
+     *  the body still runs to completion once acquired (cutting a RUNNING
+     *  body short would reopen the exact interleave this lock exists to
+     *  prevent). On acquire-timeout, `fn` NEVER runs and the caller may give
+     *  up — but the slot we took stays chained to the abandoned holder: it
+     *  resolves only when THAT holder releases, never eagerly, so a holder
+     *  enqueued after us still cannot run concurrently with the still-running
+     *  one. (Eager release here would let a post-timeout storeNode interleave
+     *  with a mid-flight compaction — RD-F13, reintroduced through the back
+     *  door.) Omitted by every non-shutdown caller — the normal path is
+     *  unchanged. */
+    private async _withMaintenanceLock<T>(
+        fn: () => Promise<T>,
+        opts?: { acquireTimeoutMs?: number },
+    ): Promise<T> {
         const prev = this._maintenanceLock;
         let release!: () => void;
         this._maintenanceLock = new Promise<void>((r) => { release = r; });
-        await prev;
+        let acquired = false;
         try {
+            if (opts?.acquireTimeoutMs === undefined) {
+                await prev;
+                acquired = true;
+            } else {
+                // prev only ever resolves (release() in the finally) — it can
+                // never reject — so this race has exactly one loser: the timer.
+                // clearTimeout on win so a fired-and-forgotten timer can never
+                // delay process exit; after a timeout the timer has already
+                // fired and completed on its own.
+                await new Promise<void>((resolve, reject) => {
+                    const timer = setTimeout(
+                        () => reject(new Error(`maintenance lock not acquired within ${opts.acquireTimeoutMs}ms`)),
+                        opts.acquireTimeoutMs,
+                    );
+                    void prev.then(() => { clearTimeout(timer); resolve(); });
+                });
+                acquired = true;
+            }
             return await fn();
         } finally {
-            release();
+            if (acquired) release();
+            // Timeout path: hold OUR slot until the holder we abandoned
+            // releases theirs — the chain stays a real mutex even though this
+            // caller has walked away. prev never rejects, so this always
+            // resolves eventually (or never — in which case every later
+            // holder waits exactly as it would have without a timeout).
+            else void prev.then(() => release());
         }
     }
 
@@ -267,9 +321,49 @@ export class EmbeddedLore implements LoreWriter {
     /** Closes Kùzu + LanceDB handles deterministically (host-owned lifecycle).
      *  Serialized through the maintenance lock: disposing while a compaction /
      *  retention sweep is mid-flight is exactly the interleave RD-F13's lock
-     *  guards writes against (LanceDB version corruption). */
-    async close(): Promise<void> {
-        await this._withMaintenanceLock(() => this.lore.dispose('atlas close'));
+     *  guards writes against (LanceDB version corruption).
+     *
+     *  SHUTDOWN-WEDGE GUARD — the lock wait is BOUNDED (CLOSE_LOCK_TIMEOUT_MS,
+     *  overridable for tests). The lock is a promise-chain mutex released only
+     *  when the holder's own promise settles, and a holder's native call
+     *  (LanceDB optimize() during a detached post-flush fold, or any write
+     *  path's kuzu/lancedb op) can wedge indefinitely — daemon.ts's own
+     *  maintenance comment: "in the worst case, wedge the process
+     *  indefinitely." An unbounded wait here therefore hangs ALL of shutdown
+     *  (closeAllEmbedded has no deadline around close()). On timeout we do
+     *  NOT force-dispose — tearing down native handles under a mid-flight
+     *  compaction is the RD-F13 corruption itself — we SKIP this workspace's
+     *  clean dispose, log loudly, and let the OS reap the handles at process
+     *  exit. That is exactly the state a crash mid-compaction already leaves,
+     *  which the system is built to survive: verbatim-queue.jsonl replays on
+     *  the next start, "[outbox] boot recovery" drains the outbox, and the
+     *  next maintenance pass reclaims what an interrupted compaction left.
+     *  Restartability outranks a pristine shutdown for this ONE workspace.
+     *
+     *  @param lockTimeoutMs acquire bound for the maintenance lock; defaults
+     *   to CLOSE_LOCK_TIMEOUT_MS. Optional so LoreWriter's close(): Promise<void>
+     *   stays satisfied for every existing caller. */
+    async close(lockTimeoutMs: number = CLOSE_LOCK_TIMEOUT_MS): Promise<void> {
+        try {
+            await this._withMaintenanceLock(
+                () => this.lore.dispose('atlas close'),
+                { acquireTimeoutMs: lockTimeoutMs },
+            );
+        } catch (err) {
+            if (!(err instanceof Error) || !err.message.includes('maintenance lock not acquired')) throw err;
+            // Loud by design: this workspace's native handles were NOT cleanly
+            // disposed — the lossiest shutdown outcome short of a crash, and
+            // invisible unless it's greppable in daemon.err. [atlas] CRITICAL
+            // prefix = the "stop and read me" tier this repo reserves for
+            // state-losing events.
+            console.error(
+                `[atlas] CRITICAL: close() for workspace '${this.workspace}' abandoned the maintenance lock ` +
+                `after ${lockTimeoutMs}ms — a native compaction/write appears wedged. SKIPPING its clean ` +
+                `dispose (never mid-write — that is the RD-F13 corruption interleave); the OS will reap the ` +
+                `handles at process exit and the next start's journal replay + outbox boot recovery heal ` +
+                `this workspace. Error: ${err.message}`,
+            );
+        }
     }
 
     /**

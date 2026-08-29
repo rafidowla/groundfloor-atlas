@@ -33,6 +33,42 @@ const refCounts = new Map<string, number>();
  *  exceeded the least-recently-used IDLE instance is closed and evicted. */
 const MAX_OPEN = 10;
 
+/** Pin-while-pending (verbatim flush drain): injected predicate — TRUE for a
+ *  dataDir whose workspace has a non-empty verbatim flush queue AND whose
+ *  flush circuit breaker is closed or half-open. Such an idle instance is
+ *  exempt from LRU eviction: the 30s flush tick would otherwise close+reopen
+ *  it on every pass while it is actively mid-drain. INJECTED (daemon boot
+ *  wires verbatimQueue.isDirFlushPendingEligible here) rather than imported
+ *  because verbatimQueue already imports this module — a static back-import
+ *  would be circular. Null = no pinning (tests, non-daemon entry points). */
+let hasPendingEligibleFlush: ((dir: string) => boolean) | null = null;
+
+export function setPendingFlushPredicate(fn: ((dir: string) => boolean) | null): void {
+    hasPendingEligibleFlush = fn;
+}
+
+/** Cap on how many dirs the pin above may exempt from eviction: without it,
+ *  a pathological multi-workspace verbatim backlog would pin every idle
+ *  instance and turn the LRU cap into unbounded cache growth (a memory
+ *  leak, the exact failure class MAX_OPEN exists to prevent). Over-cap
+ *  pending dirs fall back to plain LRU with a log line. */
+const MAX_FLUSH_PINNED = 5;
+
+/** Per-dir eviction/reopen counters for the health surface (workspace_status):
+ *  how many times this dir was LRU-evicted, and how many times it was
+ *  re-opened after previously being seen. Churn here = an over-cap registry
+ *  thrashing a workspace, or a pinned-then-expired drain. */
+interface DirLifecycle {
+    evictions: number;
+    reopens: number;
+}
+
+const dirLifecycle = new Map<string, DirLifecycle>();
+
+export function embeddedDirLifecycle(dir: string): { evictions: number; reopens: number } {
+    return dirLifecycle.get(dir) ?? { evictions: 0, reopens: 0 };
+}
+
 /**
  * RD-Mquarantine — corrupt-store circuit breaker.
  *
@@ -95,10 +131,16 @@ function quarantineError(dir: string): Error {
     );
 }
 
-/** Test-only: reset the quarantine/failure state for a dir (or all dirs). */
+/** Test-only: reset the quarantine/failure state (and lifecycle counters)
+ *  for a dir, or all dirs. */
 export function _resetFailureStateForTests(dir?: string): void {
-    if (dir) failureStates.delete(dir);
-    else failureStates.clear();
+    if (dir) {
+        failureStates.delete(dir);
+        dirLifecycle.delete(dir);
+    } else {
+        failureStates.clear();
+        dirLifecycle.clear();
+    }
 }
 
 /** Diagnostics: current failure count for a dir (0 if none recorded). */
@@ -159,6 +201,12 @@ export function getEmbeddedLore(cfg: AtlasConfig, workspace: string): Promise<Em
     if (isQuarantined(dir)) {
         return Promise.reject(quarantineError(dir));
     }
+    // Reopen bookkeeping for the health surface: a dir opening again after
+    // being seen before is by definition an eviction-recovery (or a fresh
+    // open after workspace_delete — still a reopen of a known dir).
+    const lifecycle = dirLifecycle.get(dir);
+    if (lifecycle) lifecycle.reopens += 1;
+    else dirLifecycle.set(dir, { evictions: 0, reopens: 0 });
     p = EmbeddedLore.open(dir);
     p.then(
         () => recordOpenSuccess(dir),
@@ -177,16 +225,41 @@ export function getEmbeddedLore(cfg: AtlasConfig, workspace: string): Promise<Em
  * temporarily over the cap rather than close a live instance; the next
  * borrow/release or open retries the eviction. `keepDir` (the just-opened
  * instance) is never chosen.
+ *
+ * Pin-while-pending: an IDLE candidate whose workspace has a non-empty
+ * verbatim flush queue (breaker closed or half-open — see the predicate
+ * block above) is exempt, capped at MAX_FLUSH_PINNED exemptions so a
+ * multi-workspace backlog cannot defeat MAX_OPEN; over-cap pending dirs
+ * fall back to plain LRU with a log line.
  */
 function evictIdleOverCap(keepDir: string): void {
     if (instances.size <= MAX_OPEN) return;
+    let pinned = 0;
+    let capLogged = false;
     for (const oldestKey of [...instances.keys()]) {
         if (instances.size <= MAX_OPEN) break;
         if (oldestKey === keepDir) continue;
         if ((refCounts.get(oldestKey) ?? 0) > 0) continue; // busy — skip, don't close
+        const pending = hasPendingEligibleFlush?.(oldestKey) ?? false;
+        if (pending) {
+            if (pinned < MAX_FLUSH_PINNED) {
+                pinned += 1;
+                continue; // mid-drain workspace — keep its warm handles
+            }
+            if (!capLogged) {
+                capLogged = true;
+                console.error(
+                    `[atlas] embedded registry: flush-pin cap (${MAX_FLUSH_PINNED}) exceeded — ` +
+                        `${oldestKey} and any further pending dirs fall back to plain LRU eviction`,
+                );
+            }
+        }
         const victim = instances.get(oldestKey);
         instances.delete(oldestKey);
         refCounts.delete(oldestKey);
+        const lc = dirLifecycle.get(oldestKey);
+        if (lc) lc.evictions += 1;
+        else dirLifecycle.set(oldestKey, { evictions: 1, reopens: 0 });
         if (victim) {
             void victim.then((l) => l.close()).catch(() => { /* best-effort close */ });
         }

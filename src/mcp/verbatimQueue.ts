@@ -11,9 +11,13 @@
  * Re-storing byte-identical text before a flush replaces the queued entry;
  * after a flush the bulk upsert lands on the same id (idempotent).
  *
- * Failure posture: a transient batch failure re-queues the batch at the FRONT
- * (retried on the next tick) and stops the flush — never a hot retry loop. A
- * per-node failure inside a landed batch is logged and dropped; the node was
+ * Failure posture: a transient batch failure re-queues the batch at the BACK
+ * and the pass ROTATES to the next different workspace (never head-of-line
+ * blocking); a per-workspace circuit breaker (3 strikes → cooldown →
+ * half-open probe, mirroring embeddedRegistry's quarantine) stops a
+ * hopelessly-broken workspace from re-embedding on every tick, and a
+ * retry-path existence pre-check drops ids a timed-out write already landed.
+ * A per-node failure inside a landed batch is logged and dropped; the node was
  * rejected by the store itself, so re-queuing would be a poison pill every 30s.
  *
  * Durability posture: every enqueue appends one JSON line to a write-ahead
@@ -54,6 +58,8 @@
 
 import type { StoreNodeInput } from '../loreClient.js';
 import type { EmbeddedLore } from '../lore/embeddedLore.js';
+import type { AtlasConfig } from '../config.js';
+import { embeddedDataDir } from '../projectRegistry.js';
 import { borrowEmbeddedLore } from './embeddedRegistry.js';
 import { isShuttingDown } from '../lore/indexDrain.js';
 import { loadConfig } from '../config.js';
@@ -64,6 +70,41 @@ import * as path from 'node:path';
 /** Max nodes per bulkStoreNodes call. Keeps one embed batch small and bounded
  *  (same reasoning as the 50-file index batches, sized for interactive text). */
 export const VERBATIM_BATCH = 5;
+/** Embed-work budget per flush batch, in estimated e5 chunks. VERBATIM_BATCH
+ *  caps a batch by node COUNT — sized for interactive text (a few hundred
+ *  chars each). Real verbatim notes run to tens of KB, and Lore chunks those
+ *  at ~1200 chars/chunk before embedding: five 25k-char notes = ~120 chunks
+ *  of ONNX forward-pass work in ONE bulkStoreNodes call, which deterministically
+ *  blew the 10s step budget every tick (the 2026-08 llm-api-gateway incident:
+ *  head-of-line requeue loop, unbounded abandoned native writes, daemon CPU
+ *  climb). Capping the batch by estimated chunk cost too keeps each batch
+ *  inside the step budget; 32 = one of Lore's EMBED_FORWARD_BATCH forward
+ *  passes. A single note whose estimate alone exceeds the budget still gets
+ *  its own solo batch (batch size 1) — never skipped, never split. */
+export const VERBATIM_BATCH_CHUNK_BUDGET = 32;
+
+/** Mirrors @groundfloor/lore's LocalEmbeddingProvider chunking constants
+ *  (verified 2026-08-29: EMBED_CHUNK_CHARS=1200, EMBED_CHUNK_CHAR_OVERLAP=150,
+ *  tokenizer path 448/64). Duplicated because the provider does not export
+ *  them. The estimate uses the CHAR-window fallback (stride 1050): for
+ *  English prose it OVERESTIMATES vs the token path (~4 chars/token), so a
+ *  drift in either direction is absorbed by the solo-batch path and the
+ *  flush circuit breaker — this only sizes batches, it gates nothing. */
+const EMBED_CHUNK_CHARS_EST = 1200;
+const EMBED_CHUNK_CHAR_STRIDE_EST = 1050;
+
+/** Estimated e5 chunk count for one queued node — the same text Lore embeds
+ *  (buildVerbatimText: label + content + tags joined by blank lines), split
+ *  by the same windows. embed:false nodes cost nothing (no vector row). */
+export function estimateEmbedChunks(node: StoreNodeInput): number {
+    if (node.embed === false) return 0;
+    const parts = [node.label, node.content, node.tags].filter(
+        (p): p is string => typeof p === 'string' && p.trim() !== '',
+    );
+    const len = parts.join('\n\n').length;
+    if (len <= EMBED_CHUNK_CHARS_EST) return 1;
+    return 1 + Math.ceil((len - EMBED_CHUNK_CHARS_EST) / EMBED_CHUNK_CHAR_STRIDE_EST);
+}
 
 /** Flush cadence. Unref'd so a queue holding entries can never keep the
  *  daemon (or a test process) alive on its own. */
@@ -113,13 +154,16 @@ export const VERBATIM_FOLD_MIN_INTERVAL_MS = 120_000;
  *  underlying runMaintenance is left to finish and keeps the fold slot held
  *  (a stall suppresses later folds instead of piling concurrent maintenance
  *  onto the store). 30s = 3× a flush step budget: enough for a normal
- *  maintain pass on a modest table, short enough that a wedged one surfaces
  *  in the log quickly. */
 export const VERBATIM_FOLD_TIMEOUT_MS = 30_000;
 
 export interface QueuedVerbatim {
     workspace: string;
     node: StoreNodeInput;
+    /** When this entry was queued (epoch ms) — powers the oldest-queued-age
+     *  health signal. Journaled; replay falls back to Date.now() for lines
+     *  written before the field existed (e.g. the quarantined backlog). */
+    enqueuedAt: number;
 }
 
 /** A borrowed shared instance + its release (mirrors borrowEmbeddedLore's
@@ -176,6 +220,122 @@ let foldInFlight: Promise<void> | null = null;
  *  it to prove the time boundary deterministically. Same override
  *  precedent as journalPathOverride. */
 let foldClock: () => number = Date.now;
+
+// ── Write-failure circuit breaker ───────────────────────────────────────────
+// Port of embeddedRegistry's RD-Mquarantine open-failure pattern (3 strikes →
+// cooldown → half-open probe), applied to per-workspace FLUSH failures. The
+// registry breaker guards expensive re-OPENs of a corrupt store; this one
+// guards the re-EMBED+re-WRITE of a batch that keeps failing. Same shape and
+// naming (record*Success/Failure, isQuarantined, threshold+cooldown+half-open)
+// so the two read as one pattern.
+
+const FLUSH_FAILURE_THRESHOLD = 3;
+const FLUSH_COOLDOWN_MS = 60_000;
+
+interface FlushFailureState {
+    consecutiveFailures: number;
+    quarantinedUntil: number; // epoch ms; 0 = not quarantined
+    lastError: string;
+}
+
+const flushFailures = new Map<string, FlushFailureState>();
+
+/** True while `workspace`'s flush breaker is OPEN (past threshold, cooldown
+ *  not yet elapsed). Flush passes skip its entries entirely for the window;
+ *  after it elapses the next pass is a half-open probe batch. */
+function isFlushQuarantined(workspace: string): boolean {
+    const st = flushFailures.get(workspace);
+    if (!st) return false;
+    return st.consecutiveFailures >= FLUSH_FAILURE_THRESHOLD && Date.now() < st.quarantinedUntil;
+}
+
+/** Consecutive flush failures for a workspace (0 if none recorded). Drives
+ *  the retry-path existence pre-check and the health surface. */
+export function flushFailureStreak(workspace: string): number {
+    return flushFailures.get(workspace)?.consecutiveFailures ?? 0;
+}
+
+function recordFlushSuccess(workspace: string): void {
+    flushFailures.delete(workspace);
+}
+
+function recordFlushFailure(workspace: string, err: unknown): void {
+    const msg = (err as Error)?.message ?? String(err);
+    const prev = flushFailures.get(workspace);
+    const consecutiveFailures = (prev?.consecutiveFailures ?? 0) + 1;
+    const wasQuarantined = prev !== undefined && prev.consecutiveFailures >= FLUSH_FAILURE_THRESHOLD && Date.now() < prev.quarantinedUntil;
+    const quarantinedUntil = consecutiveFailures >= FLUSH_FAILURE_THRESHOLD ? Date.now() + FLUSH_COOLDOWN_MS : 0;
+    flushFailures.set(workspace, { consecutiveFailures, quarantinedUntil, lastError: msg });
+    // Log only on the transition INTO quarantine (and each half-open re-arm):
+    // a broken workspace must be visible without raw-log archaeology, but a
+    // per-tick repeat would spam daemon.err exactly like the overflow path
+    // this module already guards against.
+    if (!wasQuarantined && consecutiveFailures >= FLUSH_FAILURE_THRESHOLD) {
+        console.error(
+            `[atlas] verbatim flush: workspace ${workspace} failed ${consecutiveFailures} flushes in a row ` +
+                `(last error: ${msg}) — quarantining its ${FLUSH_COOLDOWN_MS / 1000}s before the next half-open probe; ` +
+                `entries stay queued (see workspace_status verbatimQueue health)`,
+        );
+    }
+}
+
+// ── Health surface (observability) ──────────────────────────────────────────
+
+/** Per-workspace queue health for workspace_status: pending depth, flush
+ *  failure streak, breaker state, and the age of the oldest queued entry.
+ *  A streak ≥ FLUSH_FAILURE_THRESHOLD is visible here without raw logs. */
+export interface VerbatimQueueHealth {
+    /** Entries currently queued for this workspace. */
+    pendingEntries: number;
+    /** Consecutive failed flush batches (0 = healthy). */
+    consecutiveFlushFailures: number;
+    /** True while the flush breaker is OPEN (cooldown window). */
+    quarantined: boolean;
+    /** Age in ms of the oldest queued entry (null = nothing queued). */
+    oldestQueuedAgeMs: number | null;
+}
+
+export function verbatimQueueHealth(workspace: string): VerbatimQueueHealth {
+    let pending = 0;
+    let oldest: number | null = null;
+    for (const e of queue) {
+        if (e.workspace !== workspace) continue;
+        pending += 1;
+        if (oldest === null || e.enqueuedAt < oldest) oldest = e.enqueuedAt;
+    }
+    const st = flushFailures.get(workspace);
+    return {
+        pendingEntries: pending,
+        consecutiveFlushFailures: st?.consecutiveFailures ?? 0,
+        quarantined: isFlushQuarantined(workspace),
+        oldestQueuedAgeMs: oldest === null ? null : Date.now() - oldest,
+    };
+}
+
+/** Item-5 predicate wired into embeddedRegistry (daemon boot) so LRU eviction
+ *  can exempt a workspace that is actively mid-drain: true while `dir`'s
+ *  workspace has a non-empty flush queue AND its breaker is closed or
+ *  half-open — NOT open (an open breaker makes the workspace flush-ineligible
+ *  for the whole cooldown, so pinning it would waste one of the registry's
+ *  capped pin slots). Takes a dataDir (the registry's key space) and maps it
+ *  back via embeddedDataDir, the same pure path math the registry uses. */
+export function isDirFlushPendingEligible(dir: string): boolean {
+    if (queue.length === 0) return false;
+    let cfg: AtlasConfig;
+    try {
+        cfg = loadConfig();
+    } catch {
+        return false; // unreadable config: pin nothing, fall back to plain LRU
+    }
+    for (const workspace of new Set(queue.map((e) => e.workspace))) {
+        try {
+            if (embeddedDataDir(cfg, workspace) === dir && !isFlushQuarantined(workspace)) return true;
+        } catch {
+            // invalid workspace name for this config — cannot be this dir
+        }
+    }
+    return false;
+}
 
 // ── Write-ahead journal ──────────────────────────────────────────────────────
 
@@ -308,7 +468,7 @@ export function enqueueVerbatim(workspace: string, node: StoreNodeInput): void {
     // comes from THIS append, never from a shutdown-time write. Synchronous
     // local disk, deliberately outside the flush's bounded-step machinery
     // (see the module header's liveness posture).
-    appendJournalLine({ workspace, node });
+    appendJournalLine({ workspace, node, enqueuedAt: Date.now() });
     // Journal hygiene: a re-store of identical text (dedup) or an overflow
     // drop leaves a stale line on disk. Rewrite so the journal mirrors the
     // queue. A crash between the append above and this rewrite replays BOTH
@@ -324,12 +484,12 @@ export function enqueueVerbatim(workspace: string, node: StoreNodeInput): void {
  *  semantics either way: last-write-wins dedup by node id, FIFO cap with a
  *  single warning per overflow episode. Returns true when an overflow drop
  *  happened (the live caller refreshes the journal; replay must not write). */
-function pushEntry(workspace: string, node: StoreNodeInput): boolean {
+function pushEntry(workspace: string, node: StoreNodeInput, enqueuedAt: number = Date.now()): boolean {
     // Same id already queued (identical text re-stored before a flush):
     // drop the earlier copy — last write wins, same as the upsert would do.
     const idx = queue.findIndex((e) => e.node.id === node.id);
     if (idx >= 0) queue.splice(idx, 1);
-    queue.push({ workspace, node });
+    queue.push({ workspace, node, enqueuedAt });
     if (queue.length > VERBATIM_QUEUE_CAP) {
         const dropped = queue.splice(0, queue.length - VERBATIM_QUEUE_CAP);
         if (!overflowWarned) {
@@ -402,7 +562,13 @@ export function replayVerbatimJournal(): VerbatimReplayResult {
                 || typeof node['workspace'] !== 'string' || node['workspace'] === '') {
                 throw new Error('not a {workspace, node{id,type,label,workspace}} line');
             }
-            pushEntry(parsed.workspace, node as unknown as StoreNodeInput);
+            pushEntry(
+                parsed.workspace,
+                node as unknown as StoreNodeInput,
+                typeof (parsed as { enqueuedAt?: unknown }).enqueuedAt === 'number' && Number.isFinite((parsed as { enqueuedAt: number }).enqueuedAt)
+                    ? (parsed as { enqueuedAt: number }).enqueuedAt
+                    : Date.now(),
+            );
             result.replayed += 1;
         } catch {
             result.malformed += 1;
@@ -429,6 +595,7 @@ export function _resetVerbatimQueueForTest(): void {
     queue.length = 0;
     overflowWarned = false;
     journalWarned = false;
+    flushFailures.clear();
     journalPathCache = null;
     batchesSinceFold = 0;
     lastFoldAt = 0;
@@ -451,7 +618,12 @@ export function _verbatimFoldForTests(): { batchesSinceFold: number; lastFoldAt:
 
 /**
  * Flush the queue: process entries in FIFO order, grouping each consecutive
- * same-workspace run into bulkStoreNodes batches of <= VERBATIM_BATCH.
+ * same-workspace run into bulkStoreNodes batches bounded BOTH by node count
+ * (VERBATIM_BATCH) and by estimated embed work (VERBATIM_BATCH_CHUNK_BUDGET —
+ * a batch of large notes must not deterministically blow the step budget, the
+ * 2026-08 head-of-line incident). A failing batch is requeued to the back and
+ * the pass rotates to the next DIFFERENT workspace (never head-of-line
+ * blocking), under a per-workspace failure circuit breaker.
  *
  * `borrow` substitutes the lore source (tests pass a scratch EmbeddedLore);
  * `deadlineMs` bounds the whole flush (daemon shutdown uses 10s; the periodic
@@ -606,94 +778,185 @@ async function runFlushPass(
         if (abandoned) abandoned.then(() => undefined, () => undefined).finally(() => b.release());
         else b.release();
     };
+    /** Workspaces this pass has already failed (or that are breaker-open):
+     *  entries belonging to them are rotated to the back, NOT retried this
+     *  pass — one workspace's poison batch must not starve the rest. */
+    const unprocessable = new Set<string>();
+    const headIsUnprocessable = () =>
+        unprocessable.has(queue[0]!.workspace) || isFlushQuarantined(queue[0]!.workspace);
+    // Every step's budget: the per-step cap, or whatever is left of the
+    // pass deadline if smaller.
+    const stepBudget = () => Math.max(1, Math.min(VERBATIM_FLUSH_STEP_MS, deadline - Date.now()));
+    /** Land `entries` for `workspace`: ensure the borrow, existence-pre-check
+     *  on the retry path, bulkStoreNodes, embed settle, fold arming. Throws
+     *  on failure (the caller requeues); returns once every entry has either
+     *  landed or been verified already-landed-and-dropped. */
+    const attemptStore = async (workspace: string, entries: QueuedVerbatim[]): Promise<void> => {
+        if (!borrowed || borrowedWorkspace !== workspace) {
+            dropBorrow();
+            const borrowP = borrow(workspace);
+            const ob = await stepBounded(borrowP, stepBudget());
+            if (ob.state === 'timeout') {
+                // The open may still complete later — release the borrow
+                // whenever it does, and fail this batch for this pass.
+                borrowP.then((late) => late.release()).catch(() => undefined);
+                throw new Error(`borrow timed out after ${stepBudget()}ms`);
+            }
+            if (ob.state === 'error') throw ob.error;
+            borrowed = ob.value;
+            borrowedWorkspace = workspace;
+        }
+        let toStore = entries;
+        // Existence pre-check, RETRY PATH ONLY (the workspace has a failure
+        // streak): a batch that timed out may have landed natively after the
+        // pass gave up on it — nothing cancels the abandoned write — so look
+        // up each deterministic verbatim:<sha> id and drop the ones already
+        // in the store instead of paying their embed cost again on every
+        // retry. A healthy workspace (streak 0) pays nothing.
+        if (flushFailureStreak(workspace) > 0) {
+            const survivors: QueuedVerbatim[] = [];
+            for (const e of entries) {
+                const og = await stepBounded(
+                    Promise.resolve().then(() => borrowed!.lore.getNode(e.node.id)),
+                    stepBudget(),
+                );
+                if (og.state === 'value' && og.value != null) {
+                    claimedEntries -= 1;
+                    removedEntries = true;
+                    result.flushed += 1; // verified landed by a prior (timed-out) write
+                } else {
+                    survivors.push(e);
+                }
+            }
+            if (survivors.length < entries.length) {
+                console.error(
+                    `[atlas] verbatim flush retry for ${workspace}: ${entries.length - survivors.length} entr` +
+                        `${entries.length - survivors.length === 1 ? 'y' : 'ies'} already landed — dropped instead of re-embedded`,
+                );
+            }
+            if (survivors.length === 0) {
+                recordFlushSuccess(workspace);
+                return;
+            }
+            toStore = survivors;
+        }
+        const storeP = borrowed.lore.bulkStoreNodes(toStore.map((e) => e.node));
+        const os = await stepBounded(storeP, stepBudget());
+        if (os.state === 'timeout') {
+            // The write may still land natively — pin the instance until
+            // it settles (RC #4). The batch is requeued below and retried
+            // next pass; the upsert by deterministic id is idempotent, and
+            // the retry-path existence pre-check above drops the stragglers.
+            dropBorrow(storeP);
+            throw new Error(`bulkStoreNodes timed out after ${stepBudget()}ms`);
+        }
+        if (os.state === 'error') throw os.error;
+        result.batches += 1;
+        result.flushed += os.value.succeeded;
+        recordFlushSuccess(workspace);
+        // Landed (or rejected-and-dropped) — the batch is permanently
+        // out of the queue now.
+        claimedEntries -= toStore.length;
+        removedEntries = true;
+        if (os.value.succeeded < os.value.count) {
+            result.failed += os.value.count - os.value.succeeded;
+            for (const r of os.value.results) {
+                if (!r.ok) console.error(`[atlas] verbatim store rejected ${r.id}: ${r.error}`);
+            }
+        }
+        // Mirror knowledge_store's same-turn contract: settle the embed
+        // queue so a store → verbatim_recall right after the flush sees
+        // the vector. Best-effort and bounded: embed:'sync' persists the
+        // vectors BEFORE bulkStoreNodes resolves, so the batch has landed
+        // regardless — a slow or stuck settle must not fail or requeue
+        // it, and must not wedge the pass.
+        const settleP = borrowed.lore.awaitEmbeds();
+        const ov = await stepBounded(settleP, stepBudget());
+        if (ov.state === 'timeout') {
+            console.error(
+                `[atlas] verbatim flush: embed settle timed out for workspace ${workspace} — batch already landed, continuing`,
+            );
+            dropBorrow(settleP);
+        } else if (ov.state === 'error') {
+            console.error(
+                `[atlas] verbatim flush: embed settle failed for workspace ${workspace}: ${(ov.error as Error)?.message ?? String(ov.error)} — batch already landed, continuing`,
+            );
+        }
+
+        // Search-visibility fold: the row + vector are durable now, but
+        // Lore only folds new rows into the FTS/vector indices on a
+        // maintenance/optimize pass (the 20-min daemon ticker or a fresh
+        // process) — until one runs, keyword/BM25 search cannot see this
+        // batch. Fire the rate-limited, fully detached fold (see
+        // maybeFoldVerbatimIndex) so visibility lags by seconds-to-minutes
+        // instead of up to the full ticker interval. NOT awaited, NOT
+        // inside the step budget — a slow or stalled fold must never be
+        // able to wedge or stall this pass (pre-4e89f57 lesson).
+        batchesSinceFold += 1;
+        maybeFoldVerbatimIndex(borrow, workspace);
+    };
     while (queue.length > 0) {
+        if (Date.now() >= deadline) break; // pass budget exhausted — rest waits for the next tick
+        if (headIsUnprocessable()) {
+            // Rotate, don't break: a failed/quarantined workspace's entries
+            // go to the back so the NEXT workspace's batch surfaces. Only
+            // when nothing else is processable does the pass stop.
+            if (queue.every((e) => unprocessable.has(e.workspace) || isFlushQuarantined(e.workspace))) break;
+            queue.push(queue.shift()!);
+            continue;
+        }
         const workspace = queue[0]!.workspace;
+        // Content-sized batch: consecutive same-workspace entries, capped by
+        // node count (VERBATIM_BATCH) AND estimated embed chunks. An entry
+        // whose estimate alone exceeds the chunk budget still enters a batch
+        // by itself (batch.length === 0 takes it unconditionally) — oversized
+        // notes are solo batches, never skipped and never a spin loop.
         const batch: QueuedVerbatim[] = [];
+        let batchChunks = 0;
         while (batch.length < VERBATIM_BATCH && queue.length > 0 && queue[0]!.workspace === workspace) {
+            const nextChunks = estimateEmbedChunks(queue[0]!.node);
+            if (batch.length > 0 && batchChunks + nextChunks > VERBATIM_BATCH_CHUNK_BUDGET) break;
             batch.push(queue.shift()!);
+            batchChunks += nextChunks;
         }
         if (batch.length === 0) continue; // unreachable; keeps the loop honest
         claimedEntries += batch.length;
-        // Every step's budget: the per-step cap, or whatever is left of the
-        // pass deadline if smaller.
-        const stepBudget = () => Math.max(1, Math.min(VERBATIM_FLUSH_STEP_MS, deadline - Date.now()));
         try {
-            if (!borrowed || borrowedWorkspace !== workspace) {
-                dropBorrow();
-                const borrowP = borrow(workspace);
-                const ob = await stepBounded(borrowP, stepBudget());
-                if (ob.state === 'timeout') {
-                    // The open may still complete later — release the borrow
-                    // whenever it does, and fail this batch for this pass.
-                    borrowP.then((late) => late.release()).catch(() => undefined);
-                    throw new Error(`borrow timed out after ${stepBudget()}ms`);
-                }
-                if (ob.state === 'error') throw ob.error;
-                borrowed = ob.value;
-                borrowedWorkspace = workspace;
-            }
-            const storeP = borrowed.lore.bulkStoreNodes(batch.map((e) => e.node));
-            const os = await stepBounded(storeP, stepBudget());
-            if (os.state === 'timeout') {
-                // The write may still land natively — pin the instance until
-                // it settles (RC #4). The batch is requeued below and retried
-                // next pass; the upsert by deterministic id is idempotent.
-                dropBorrow(storeP);
-                throw new Error(`bulkStoreNodes timed out after ${stepBudget()}ms`);
-            }
-            if (os.state === 'error') throw os.error;
-            result.batches += 1;
-            result.flushed += os.value.succeeded;
-            // Landed (or rejected-and-dropped) — the batch is permanently
-            // out of the queue now.
-            claimedEntries -= batch.length;
-            removedEntries = true;
-            if (os.value.succeeded < os.value.count) {
-                result.failed += os.value.count - os.value.succeeded;
-                for (const r of os.value.results) {
-                    if (!r.ok) console.error(`[atlas] verbatim store rejected ${r.id}: ${r.error}`);
-                }
-            }
-            // Mirror knowledge_store's same-turn contract: settle the embed
-            // queue so a store → verbatim_recall right after the flush sees
-            // the vector. Best-effort and bounded: embed:'sync' persists the
-            // vectors BEFORE bulkStoreNodes resolves, so the batch has landed
-            // regardless — a slow or stuck settle must not fail or requeue
-            // it, and must not wedge the pass.
-            const settleP = borrowed.lore.awaitEmbeds();
-            const ov = await stepBounded(settleP, stepBudget());
-            if (ov.state === 'timeout') {
-                console.error(
-                    `[atlas] verbatim flush: embed settle timed out for workspace ${workspace} — batch already landed, continuing`,
-                );
-                dropBorrow(settleP);
-            } else if (ov.state === 'error') {
-                console.error(
-                    `[atlas] verbatim flush: embed settle failed for workspace ${workspace}: ${(ov.error as Error)?.message ?? String(ov.error)} — batch already landed, continuing`,
-                );
-            }
-
-            // Search-visibility fold: the row + vector are durable now, but
-            // Lore only folds new rows into the FTS/vector indices on a
-            // maintenance/optimize pass (the 20-min daemon ticker or a fresh
-            // process) — until one runs, keyword/BM25 search cannot see this
-            // batch. Fire the rate-limited, fully detached fold (see
-            // maybeFoldVerbatimIndex) so visibility lags by seconds-to-minutes
-            // instead of up to the full ticker interval. NOT awaited, NOT
-            // inside the step budget — a slow or stalled fold must never be
-            // able to wedge or stall this pass (pre-4e89f57 lesson).
-            batchesSinceFold += 1;
-            maybeFoldVerbatimIndex(borrow, workspace);
+            await attemptStore(workspace, batch);
         } catch (err) {
-            queue.unshift(...batch);
-            claimedEntries -= batch.length;
-            // Transient (open failed/timed out, store threw/timed out): the
-            // batch goes back at the FRONT and the pass stops — retried on
-            // the next tick, never spun on.
-            console.error(
-                `[atlas] verbatim flush failed for workspace ${workspace}: ${(err as Error)?.message ?? String(err)} — ${batch.length} entr${batch.length === 1 ? 'y' : 'ies'} requeued`,
-            );
-            break;
+            // Demotion probe: a failing batch LARGER than one note gets one
+            // size-1 retry before any strike is counted — a solo note landing
+            // means "batch too big" (resize, no strike); a solo note failing
+            // too means the workspace is genuinely broken (strike). A batch
+            // that is ALREADY size 1 (the solo path above) skips the probe
+            // entirely: retrying the same single note would burn a full step
+            // budget to learn nothing.
+            let probeLanded = false;
+            if (batch.length > 1) {
+                try {
+                    await attemptStore(workspace, [batch[0]!]);
+                    probeLanded = true;
+                } catch {
+                    probeLanded = false;
+                }
+            }
+            if (probeLanded) {
+                console.error(
+                    `[atlas] verbatim flush failed for workspace ${workspace}: ${(err as Error)?.message ?? String(err)} — ` +
+                        `batch of ${batch.length} oversized (size-1 retry landed); remainder requeued, no strike counted`,
+                );
+                queue.push(...batch.slice(1)); // to the BACK: rotate, don't break
+                claimedEntries -= batch.length - 1;
+            } else {
+                recordFlushFailure(workspace, err);
+                console.error(
+                    `[atlas] verbatim flush failed for workspace ${workspace}: ${(err as Error)?.message ?? String(err)} — ` +
+                        `${batch.length} entr${batch.length === 1 ? 'y' : 'ies'} requeued (failure streak ${flushFailureStreak(workspace)})`,
+                );
+                queue.push(...batch); // to the BACK: retried on a later tick, other workspaces still drain
+                claimedEntries -= batch.length;
+            }
+            unprocessable.add(workspace);
         }
     }
     dropBorrow();

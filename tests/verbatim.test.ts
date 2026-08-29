@@ -31,6 +31,19 @@
  *             landed batch, then every 5th batch OR 2 minutes whichever
  *             fires first, at most one in flight, suppressed batches are
  *             not lost, and a parked fold never delays a flush pass.
+ *   CLAIM I — (regression, content-sized batching) large notes are batched by
+ *             estimated embed-chunk cost, not raw node count: no
+ *             bulkStoreNodes call may carry more than the chunk budget
+ *             (except a single oversized note, which travels SOLO — never
+ *             skipped), cheap notes still group, and everything lands in one
+ *             bounded pass instead of timing out and requeueing every tick
+ *             (the 2026-08 llm-api-gateway head-of-line incident shape).
+ *   CLAIM J — (regression, rotate-not-break) one workspace's failing batch
+ *             must not block a DIFFERENT workspace's queued entries: the
+ *             pass rotates past the failure (requeue to the back) and drains
+ *             the healthy workspace sitting BEHIND it in FIFO order. Also
+ *             exercises the retry-path existence pre-check and the
+ *             workspace_status health surface (streak, pending, breaker).
  */
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -38,8 +51,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { EmbeddedLore } from '../src/lore/embeddedLore.js';
 import { runVerbatimStore, runVerbatimRecall, parseVerbatimContent, buildVerbatimNode } from '../src/mcp/tools/verbatim.js';
-import { flushVerbatimQueue, replayVerbatimJournal, _resetVerbatimQueueForTest, _setVerbatimJournalPathForTests,
-    _setVerbatimFoldClockForTests, _verbatimFoldForTests, VERBATIM_FOLD_EVERY_BATCHES, VERBATIM_FOLD_MIN_INTERVAL_MS } from '../src/mcp/verbatimQueue.js';
+import { flushVerbatimQueue, replayVerbatimJournal, enqueueVerbatim, _resetVerbatimQueueForTest, _setVerbatimJournalPathForTests,
+    _setVerbatimFoldClockForTests, _verbatimFoldForTests, VERBATIM_FOLD_EVERY_BATCHES, VERBATIM_FOLD_MIN_INTERVAL_MS,
+    estimateEmbedChunks, VERBATIM_BATCH_CHUNK_BUDGET, verbatimQueueHealth } from '../src/mcp/verbatimQueue.js';
+import type { StoreNodeInput } from '../src/loreClient.js';
 
 /** Open a scratch dedicated instance (the way the registry isolates a
  *  workspace) and pair it with a queue `borrow` that hands it to the flush. */
@@ -447,6 +462,197 @@ async function main(): Promise<void> {
                 // Back to the file-wide scratch journal, fresh-process state.
                 _setVerbatimJournalPathForTests(path.join(journalHome, 'verbatim-queue.jsonl'));
                 _resetVerbatimQueueForTest();
+            }
+        }
+
+        // ── CLAIM I (regression, content-sized batching) — batches are
+        //    bounded by estimated embed-chunk WORK, not raw node count.
+        //    Live incident shape (2026-08 llm-api-gateway): five ~25k-char
+        //    notes = ~120 e5 chunks in ONE bulkStoreNodes call, which blew
+        //    the 10s step budget every 30s tick, requeued at the front, and
+        //    broke the whole pass — starving every other workspace. Here a
+        //    counting borrow records every store call; the assertions are on
+        //    the ACTUAL nodes handed to the store, re-estimated through the
+        //    same exported estimator the batching uses.
+        {
+            const iHome = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-verbatim-i-journal-'));
+            cleanup.push(() => fs.rmSync(iHome, { recursive: true, force: true }));
+            _setVerbatimJournalPathForTests(path.join(iHome, 'verbatim-queue.jsonl'));
+            _resetVerbatimQueueForTest();
+            const { lore, dir, borrow } = await openScratch('i');
+            cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+            // Counting lore: real store, but records each bulkStoreNodes
+            // call's node count and summed chunk estimate (prototype
+            // delegation keeps getNode/awaitEmbeds real). runMaintenance is
+            // stubbed OUT: this claim fires real folds (~200 vectors land)
+            // and a live LanceDB compaction racing lore.close() in the
+            // finally wedged the process natively once — the fold cadence is
+            // CLAIM H's job, not this claim's; keeping it real here buys
+            // nothing and costs the flake.
+            const calls: Array<{ nodes: number; chunks: number }> = [];
+            const realStore = lore.bulkStoreNodes.bind(lore);
+            const countingLore = Object.create(lore);
+            countingLore.runMaintenance = async () => ({ folded: 0 });
+            countingLore.bulkStoreNodes = (nodes: Parameters<typeof lore.bulkStoreNodes>[0]) => {
+                calls.push({
+                    nodes: nodes.length,
+                    chunks: nodes.reduce((s, n) => s + estimateEmbedChunks(n), 0),
+                });
+                return realStore(nodes);
+            };
+            const countingBorrow = async () => ({ lore: countingLore, release: () => undefined });
+            try {
+                // Medium note: ~33k chars ≈ 32 chunks — at the budget, so
+                // any two of them (64) blow it and each must travel alone.
+                // (Under the OLD count-only batching these four would have
+                // shared one batch of 5 with a small — ~130 chunks in one
+                // store call, the incident shape.)
+                const medium = (i: number) => `Medium note ${i}: ` + 'kuzu embedded graph durability probe. '.repeat(900);
+                // Small note: well under one chunk — these must still GROUP.
+                const small = (i: number) => `Small note ${i}: cheap interactive-sized verbatim text.`;
+
+                for (let i = 0; i < 4; i++) {
+                    assert.equal(runVerbatimStore({ workspace: 'ws-i', source: `session:i-m${i}`, topic: 'batch-sizing',
+                        timestamp: `2026-08-29T09:${String(i).padStart(2, '0')}:00.000Z`, text: medium(i) }).ok, true);
+                }
+                for (let i = 0; i < 3; i++) {
+                    assert.equal(runVerbatimStore({ workspace: 'ws-i', source: `session:i-s${i}`, topic: 'batch-sizing',
+                        timestamp: `2026-08-29T09:${String(10 + i).padStart(2, '0')}:00.000Z`, text: small(i) }).ok, true);
+                }
+                // Oversized note, enqueued DIRECTLY (the tool path caps text
+                // at VERBATIM_TEXT_CAP = 32KB ≈ exactly the chunk budget, so
+                // a >budget note can only arrive here): ~34.5k chars ≈ 33
+                // chunks — over the budget ALONE (solo batch by the first-
+                // entry-unconditional rule), yet still inside the 10s embed
+                // step (~7.5s measured on the reference machine; a 40-chunk
+                // note genuinely exceeds it — that path is the breaker's job).
+                // as a SOLO batch, never skipped and never split.
+                const bigNode: StoreNodeInput = {
+                    id: 'verbatim:0123456789ab',
+                    type: 'note',
+                    label: 'Oversized synthetic note: exceeds the batch chunk budget on its own',
+                    content: 'Oversized solo note body. ' + 'lancedb vector search recall probe. '.repeat(960),
+                    tags: 'verbatim,topic:batch-sizing',
+                    workspace: 'ws-i',
+                    embed: true,
+                };
+                enqueueVerbatim('ws-i', bigNode);
+
+                const tI = Date.now();
+                const fl = await flushVerbatimQueue({ borrow: countingBorrow, deadlineMs: 120_000 });
+                assert.ok(Date.now() - tI < 120_000, 'oversized-content flush returns bounded');
+                assert.equal(fl.flushed, 8, `all 8 entries (4 medium, 3 small, 1 oversized) landed in ONE pass; got ${JSON.stringify(fl)}`);
+                assert.equal(fl.remaining, 0);
+                assert.equal(fl.batches, calls.length, `result.batches matches observed store calls (${calls.length}); got ${JSON.stringify(calls)}`);
+                assert.ok(calls.length >= 6, `content-sized batching split the work across ${calls.length} calls, not one giant batch`);
+
+                // THE invariant: every store call fits the chunk budget,
+                // unless it is a single oversized note travelling solo.
+                for (const c of calls) {
+                    assert.ok(
+                        c.chunks <= VERBATIM_BATCH_CHUNK_BUDGET || c.nodes === 1,
+                        `store call of ${c.chunks} chunks / ${c.nodes} nodes fits the ${VERBATIM_BATCH_CHUNK_BUDGET}-chunk budget or is solo; got ${JSON.stringify(calls)}`,
+                    );
+                }
+                // Cheap notes still group (guards a degenerate all-solo
+                // implementation) and the oversized note got its solo batch.
+                assert.ok(calls.some((c) => c.nodes > 1 && c.chunks <= VERBATIM_BATCH_CHUNK_BUDGET),
+                    `the three small notes shared a batch; got ${JSON.stringify(calls)}`);
+                assert.ok(calls.some((c) => c.nodes === 1 && c.chunks > VERBATIM_BATCH_CHUNK_BUDGET),
+                    `the oversized note travelled as its own solo batch; got ${JSON.stringify(calls)}`);
+                // Never skipped: the oversized note is really in the store.
+                assert.ok(await lore.getNode(bigNode.id) != null, 'oversized solo note landed and is retrievable');
+                console.log(`  ✓ CLAIM I: content-sized batching — ${calls.length} store calls (budget ${VERBATIM_BATCH_CHUNK_BUDGET} chunks), small notes grouped, oversized note solo, all 8 landed in one bounded pass`);
+            } finally {
+                // Back to the file-wide scratch journal, fresh-process state.
+                _setVerbatimJournalPathForTests(path.join(journalHome, 'verbatim-queue.jsonl'));
+                _resetVerbatimQueueForTest();
+                await lore.close();
+            }
+        }
+
+        // ── CLAIM J (regression, rotate-not-break) — one workspace's
+        //    failing batch must not block a DIFFERENT workspace. The old
+        //    pass requeued the failure at the FRONT and broke out — with the
+        //    failing workspace at the head, everything behind it starved
+        //    forever (the incident's cross-workspace blast radius). Here
+        //    ws-fail's store never settles (the CLAIM F wedge shape) and it
+        //    is enqueued FIRST; ws-ok's entries sit BEHIND it in FIFO order
+        //    and must still drain in the same pass. A second pass then
+        //    proves the retry-path existence pre-check runs (getNode on the
+        //    requeued entry) and the failure streak surfaces through the
+        //    workspace_status health shape.
+        {
+            const jHome = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-verbatim-j-journal-'));
+            cleanup.push(() => fs.rmSync(jHome, { recursive: true, force: true }));
+            _setVerbatimJournalPathForTests(path.join(jHome, 'verbatim-queue.jsonl'));
+            _resetVerbatimQueueForTest();
+            const { lore, dir, borrow } = await openScratch('j');
+            cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+            let failGetNodeCalls = 0;
+            const failLore = {
+                bulkStoreNodes: () => new Promise<never>(() => undefined),
+                awaitEmbeds: () => Promise.resolve(),
+                getNode: async () => {
+                    failGetNodeCalls += 1;
+                    return null;
+                },
+            } as unknown as EmbeddedLore;
+            // ws-ok's lore: real store, but runMaintenance stubbed out — the
+            // post-landing detached fold must not put a live LanceDB
+            // compaction between this claim and its lore.close() (see the
+            // CLAIM I note; fold cadence is CLAIM H's job).
+            const okLore = Object.create(lore);
+            okLore.runMaintenance = async () => ({ folded: 0 });
+            const routingBorrow = async (workspace: string) =>
+                workspace === 'ws-fail'
+                    ? { lore: failLore, release: () => undefined }
+                    : { lore: okLore, release: () => undefined };
+            try {
+                const sFail = runVerbatimStore({ workspace: 'ws-fail', source: 'session:j-fail', topic: 'rotate-regression',
+                    timestamp: '2026-08-29T10:00:00.000Z', text: 'Rotate regression: this workspace store never settles; a different workspace must still drain.' });
+                const ok1 = runVerbatimStore({ workspace: 'ws-ok', source: 'session:j-ok1', topic: 'rotate-regression',
+                    timestamp: '2026-08-29T10:01:00.000Z', text: 'Healthy sibling one: must land in the SAME pass as the failing workspace ahead of it.' });
+                const ok2 = runVerbatimStore({ workspace: 'ws-ok', source: 'session:j-ok2', topic: 'rotate-regression',
+                    timestamp: '2026-08-29T10:02:00.000Z', text: 'Healthy sibling two: same pass, FIFO order behind the poison head.' });
+
+                // Budget: one 10s wedged step for ws-fail, then the healthy
+                // drain. The wedge is what the old code broke the pass on.
+                const tJ = Date.now();
+                const fl = await flushVerbatimQueue({ borrow: routingBorrow, deadlineMs: 30_000 });
+                assert.ok(Date.now() - tJ < 30_000, 'rotate pass returned bounded');
+                assert.equal(fl.flushed, 2, `ws-ok drained BEHIND the failing ws-fail head in the same pass; got ${JSON.stringify(fl)}`);
+                assert.equal(fl.remaining, 1, `only the failing workspace's entry stays queued; got ${JSON.stringify(fl)}`);
+                assert.ok(await lore.getNode(ok1.id) != null, 'ws-ok entry one really landed');
+                assert.ok(await lore.getNode(ok2.id) != null, 'ws-ok entry two really landed');
+
+                // Health surface (workspace_status shape): the failure is
+                // visible WITHOUT raw logs — streak 1, breaker not yet open.
+                const hFail = verbatimQueueHealth('ws-fail');
+                assert.equal(hFail.pendingEntries, 1);
+                assert.equal(hFail.consecutiveFlushFailures, 1);
+                assert.equal(hFail.quarantined, false, 'one strike must not open the breaker');
+                assert.ok(typeof hFail.oldestQueuedAgeMs === 'number', 'oldest queued entry age is surfaced');
+                const hOk = verbatimQueueHealth('ws-ok');
+                assert.equal(hOk.pendingEntries, 0);
+                assert.equal(hOk.consecutiveFlushFailures, 0);
+
+                // Second pass: the requeued ws-fail entry goes through the
+                // retry-path existence pre-check (streak > 0 → getNode per
+                // id) before wedging again — strike two, still bounded,
+                // still not blocking anything else (queue holds nothing
+                // else now).
+                const fl2 = await flushVerbatimQueue({ borrow: routingBorrow, deadlineMs: 15_000 });
+                assert.equal(fl2.flushed, 0);
+                assert.equal(fl2.remaining, 1, `ws-fail entry honestly requeued; got ${JSON.stringify(fl2)}`);
+                assert.equal(failGetNodeCalls, 1, `retry-path pre-check looked the requeued entry up exactly once; got ${failGetNodeCalls}`);
+                assert.equal(verbatimQueueHealth('ws-fail').consecutiveFlushFailures, 2, 'second strike recorded');
+                console.log('  ✓ CLAIM J: a failing workspace no longer blocks a different workspace — ws-ok drained behind the poison head, streak/pre-check surfaced via health');
+            } finally {
+                // Back to the file-wide scratch journal, fresh-process state.
+                _setVerbatimJournalPathForTests(path.join(journalHome, 'verbatim-queue.jsonl'));
+                _resetVerbatimQueueForTest();
+                await lore.close();
             }
         }
 

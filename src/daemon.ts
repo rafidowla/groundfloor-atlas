@@ -16,8 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, readAtlasToken } from './config.js';
 import { startAtlasMcpServer } from './mcp/server.js';
 import { startLore, type LoreSidecarHandle } from './sidecar/loreSidecar.js';
-import { closeAllEmbedded, hasOpenEmbedded, openEmbeddedInstances } from './mcp/embeddedRegistry.js';
-import { flushVerbatimQueue, replayVerbatimJournal, VERBATIM_SHUTDOWN_FLUSH_MS } from './mcp/verbatimQueue.js';
+import { closeAllEmbedded, hasOpenEmbedded, openEmbeddedInstances, setPendingFlushPredicate } from './mcp/embeddedRegistry.js';
+import { flushVerbatimQueue, replayVerbatimJournal, isDirFlushPendingEligible, VERBATIM_SHUTDOWN_FLUSH_MS } from './mcp/verbatimQueue.js';
 import { drainIndexWork } from './lore/indexDrain.js';
 
 /** RC #3 — max time the shutdown handler waits for an in-flight index to reach a
@@ -214,6 +214,17 @@ export async function runDaemon(opts: { port?: number } = {}): Promise<void> {
 
     process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
     process.on('SIGINT',  () => { void shutdown('SIGINT'); });
+
+    // ── 0a. Pin-while-pending wiring (verbatim flush drain) ─────────────────
+    // Inject verbatimQueue's flush-pending predicate into the embedded
+    // registry BEFORE any store can open: an idle instance whose workspace
+    // still has queued verbatim entries (flush breaker closed/half-open) is
+    // exempt from LRU eviction while it is mid-drain — otherwise the 30s
+    // flush tick closes+reopens the same dir on every pass (evict/reopen
+    // churn visible in workspace_status `registry`). Injected here rather
+    // than imported statically inside embeddedRegistry because verbatimQueue
+    // already imports that module — the back-import would be circular.
+    setPendingFlushPredicate(isDirFlushPendingEligible);
 
     // ── 0b. Verbatim journal replay — recover what a hard kill left behind ──
     // Every enqueue journals write-ahead (mcp/verbatimQueue.ts), so entries

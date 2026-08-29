@@ -17,7 +17,8 @@ import { flagUnbackedWork } from '../pmDecision.js';
 import { resolveLoreContext, tokenMissingError } from './context.js';
 import { scrubKnowledgeFields } from '../security/secretScrub.js';
 import { resolveCodeReader } from './loreReaderFactory.js';
-import { withEmbeddedLore, borrowEmbeddedLore, closeEmbeddedLore, embeddedBaseDir, embeddedDataDir } from './embeddedRegistry.js';
+import { withEmbeddedLore, borrowEmbeddedLore, closeEmbeddedLore, embeddedBaseDir, embeddedDataDir, embeddedDirLifecycle } from './embeddedRegistry.js';
+import { verbatimQueueHealth } from './verbatimQueue.js';
 import { writeStatsSnapshot, buildWorkspaceStatsEntry } from './statsSnapshot.js';
 import { acquireWorkspaceWriteLock, WorkspaceLockedError } from '../lore/writerLock.js';
 import { beginIndexWork, endIndexWork, isShuttingDown } from '../lore/indexDrain.js';
@@ -1189,7 +1190,8 @@ export function buildRegistry(bootTimeMs: number): ToolRegistry {
                 try {
                     const dir = embeddedDataDir(cfg, wsName);
                     if (!fs.existsSync(dir)) {
-                        return { ok: true, embedded: true, workspace: wsName, exists: false, dataDir: dir };
+                        return { ok: true, embedded: true, workspace: wsName, exists: false, dataDir: dir,
+                            verbatimQueue: verbatimQueueHealth(wsName), registry: embeddedDirLifecycle(dir) };
                     }
                     return withEmbeddedLore(cfg, wsName, async (lore) => {
                         // RD-status-oom — count via Cypher count(), NOT listNodes/
@@ -1226,6 +1228,15 @@ export function buildRegistry(bootTimeMs: number): ToolRegistry {
                             nodeCount: stats.nodeCount,
                             edgeCount: stats.edgeCount,
                             typeBreakdown: stats.typeBreakdown,
+                            // Flush-drain health (2026-08 incident follow-up): the
+                            // verbatim queue's per-workspace depth, consecutive
+                            // flush-failure streak, breaker state, and oldest-entry
+                            // age, plus this dir's LRU eviction/reopen counters —
+                            // a stuck drain (streak >= 3) must be visible here
+                            // without reading raw daemon logs. Both are in-memory
+                            // reads; never open a store for them.
+                            verbatimQueue: verbatimQueueHealth(wsName),
+                            registry: embeddedDirLifecycle(dir),
                         };
                     });
                 } catch (err) {

@@ -9,6 +9,7 @@
  * daemon shutdown. The short-lived CLI (`atlas index`) opens its own instead.
  */
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { EmbeddedLore } from '../lore/embeddedLore.js';
 import { loadConfig } from '../config.js';
@@ -28,10 +29,122 @@ const instances = new Map<string, Promise<EmbeddedLore>>();
 const refCounts = new Map<string, number>();
 
 /** RD-Mregistry — cap concurrently-open embedded instances. Each one holds
- *  kuzu+lancedb+sqlite handles; an unbounded daemon serving many workspaces
- *  would leak file descriptors / memory without bound. When the cap is
- *  exceeded the least-recently-used IDLE instance is closed and evicted. */
-const MAX_OPEN = 10;
+ *  native graph+lancedb+sqlite handles plus (in the daemon) a ~600MiB
+ *  search-worker child; an unbounded daemon serving many workspaces would
+ *  leak file descriptors / memory without bound. When the cap is exceeded
+ *  the least-recently-used IDLE instance is closed and evicted.
+ *
+ *  The cap is MEMORY-ADAPTIVE (2026-08): the old fixed 10 was right for
+ *  nobody — dangerous on an 8GiB laptop, needlessly tight on a 128GiB
+ *  workstation. Derived from os.totalmem() by computeAdaptiveMaxOpen below,
+ *  installed once at daemon boot (applyAdaptiveMaxOpen, daemon.ts) and
+ *  force-able by operators via ATLAS_EMBEDDED_MAX_OPEN. */
+
+/** Memory budget fraction — the daemon's worst-case footprint for open
+ *  stores may claim at most half the machine's RAM; the other half belongs
+ *  to the OS / IDE / browser. TOTAL (not free) memory is the signal:
+ *  freemem() is a boot-moment snapshot dominated by transient page cache
+ *  (measured 12GiB "free" on this 128GiB box mid-build), so a freemem-based
+ *  cap would swing run-to-run — totalmem() is stable, matching the
+ *  compute-once-at-boot-for-predictability goal. */
+const MEM_BUDGET_FRACTION = 0.5;
+
+/** Worst-case resident cost of ONE open workspace, the divisor of the cap.
+ *  Dominated by the search-worker child's own embedding-model copy when
+ *  LORE_SEARCH_WORKER=1 (the daemon plist always sets it — cli/service.ts):
+ *  ~600MiB RSS per child, measured this session (a live re-read under load
+ *  showed 777MB; 600MiB is the canonical budget figure). Also upper-bounds
+ *  the cheaper worker-less config, so the cap errs conservative there. */
+const PER_WORKSPACE_MEM_BYTES = 600 * 1024 * 1024;
+
+/** Floor: even a tiny machine keeps a useful working set (current workspace
+ *  plus a couple of recents) — eviction thrash below that costs more than
+ *  the memory it saves. */
+const MIN_OPEN = 3;
+
+/** Ceiling: bounds file-descriptor growth on huge machines, where the raw
+ *  memory formula alone would admit hundreds. Measured per open workspace:
+ *  ~36 daemon-side store FDs + ~35 in the worker child ≈ 90 total, so 64
+ *  open ≈ 5.8K FDs — comfortable under the common effective limits (libuv
+ *  raises the soft limit at startup; 1048576 observed here). Operators in
+ *  tighter containers use ATLAS_EMBEDDED_MAX_OPEN. */
+const MAX_OPEN_CEILING = 64;
+
+/** ATLAS_EMBEDDED_MAX_OPEN=<n> forces the cap (positive integer, honored
+ *  UNCLAMPED — an operator forcing a value knows better than the heuristic;
+ *  anything else is warned about and ignored). Same env-override shape as
+ *  ATLAS_PORT et al. */
+const MAX_OPEN_ENV = 'ATLAS_EMBEDDED_MAX_OPEN';
+
+/** The derived cap plus every input that produced it, so the boot log and
+ *  the workspace_status health surface can show WHY a value was chosen, not
+ *  just that one was. */
+export interface AdaptiveMaxOpen {
+    maxOpen: number;
+    /** 'env-override' = forced via ATLAS_EMBEDDED_MAX_OPEN; 'adaptive' = memory-derived. */
+    source: 'env-override' | 'adaptive';
+    totalMemBytes: number;
+    /** totalMemBytes × MEM_BUDGET_FRACTION; null when env-forced (no budget was consulted). */
+    memBudgetBytes: number | null;
+    perWorkspaceBytes: number;
+    minOpen: number;
+    ceiling: number;
+}
+
+/** Pure derivation of the registry cap: floor(budget / per-workspace-cost)
+ *  clamped to [MIN_OPEN, MAX_OPEN_CEILING], or the env override verbatim. */
+export function computeAdaptiveMaxOpen(totalMemBytes: number, envOverride?: string): AdaptiveMaxOpen {
+    const forced = envOverride === undefined ? NaN : Number(envOverride);
+    if (Number.isInteger(forced) && forced >= 1) {
+        return {
+            maxOpen: forced,
+            source: 'env-override',
+            totalMemBytes,
+            memBudgetBytes: null,
+            perWorkspaceBytes: PER_WORKSPACE_MEM_BYTES,
+            minOpen: MIN_OPEN,
+            ceiling: MAX_OPEN_CEILING,
+        };
+    }
+    if (envOverride !== undefined) {
+        console.error(
+            `[atlas] ${MAX_OPEN_ENV}="${envOverride}" is not a positive integer — ignoring it and using the memory-adaptive cap`,
+        );
+    }
+    const memBudgetBytes = Math.floor(totalMemBytes * MEM_BUDGET_FRACTION);
+    const raw = Math.floor(memBudgetBytes / PER_WORKSPACE_MEM_BYTES);
+    return {
+        maxOpen: Math.min(MAX_OPEN_CEILING, Math.max(MIN_OPEN, raw)),
+        source: 'adaptive',
+        totalMemBytes,
+        memBudgetBytes,
+        perWorkspaceBytes: PER_WORKSPACE_MEM_BYTES,
+        minOpen: MIN_OPEN,
+        ceiling: MAX_OPEN_CEILING,
+    };
+}
+
+/** Current decision. Seeded at module load so non-daemon importers get a
+ *  sane machine-appropriate cap too; the daemon boot re-derives + logs it
+ *  via applyAdaptiveMaxOpen() (same inputs → same value; os.totalmem() is
+ *  stable, so this is deterministic either way). */
+let maxOpenDecision: AdaptiveMaxOpen = computeAdaptiveMaxOpen(os.totalmem(), process.env[MAX_OPEN_ENV]);
+
+/** (Re)derive + install the cap. Called once from the daemon boot sequence,
+ *  BEFORE any store can open, and from tests to pin specific scenarios.
+ *  Returns the decision so the caller can log/expose it. */
+export function applyAdaptiveMaxOpen(
+    totalMemBytes: number = os.totalmem(),
+    envOverride: string | undefined = process.env[MAX_OPEN_ENV],
+): AdaptiveMaxOpen {
+    maxOpenDecision = computeAdaptiveMaxOpen(totalMemBytes, envOverride);
+    return maxOpenDecision;
+}
+
+/** The currently-installed cap decision (observability: workspace_status). */
+export function embeddedMaxOpen(): AdaptiveMaxOpen {
+    return maxOpenDecision;
+}
 
 /** Pin-while-pending (verbatim flush drain): injected predicate — TRUE for a
  *  dataDir whose workspace has a non-empty verbatim flush queue AND whose
@@ -233,11 +346,12 @@ export function getEmbeddedLore(cfg: AtlasConfig, workspace: string): Promise<Em
  * fall back to plain LRU with a log line.
  */
 function evictIdleOverCap(keepDir: string): void {
-    if (instances.size <= MAX_OPEN) return;
+    const cap = maxOpenDecision.maxOpen; // adaptive — see computeAdaptiveMaxOpen
+    if (instances.size <= cap) return;
     let pinned = 0;
     let capLogged = false;
     for (const oldestKey of [...instances.keys()]) {
-        if (instances.size <= MAX_OPEN) break;
+        if (instances.size <= cap) break;
         if (oldestKey === keepDir) continue;
         if ((refCounts.get(oldestKey) ?? 0) > 0) continue; // busy — skip, don't close
         const pending = hasPendingEligibleFlush?.(oldestKey) ?? false;

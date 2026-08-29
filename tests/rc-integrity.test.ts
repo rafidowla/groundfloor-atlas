@@ -51,6 +51,7 @@ import {
     inFlightUsers,
     closeAllEmbedded,
     embeddedDataDir,
+    applyAdaptiveMaxOpen,
 } from '../src/mcp/embeddedRegistry.js';
 import { loadConfig } from '../src/config.js';
 
@@ -324,8 +325,13 @@ async function testLruRefCount(cleanup: string[]): Promise<void> {
     const home = mkTmp('atlas-rc-lru-home-');
     cleanup.push(home);
     const cfg = loadConfig(home);
+    // Pin the registry cap to 10 (the historical fixed value) for this
+    // scenario: MAX_OPEN is memory-adaptive since 2026-08 (64 on this box),
+    // and the eviction pressure below needs a cap the 12 filler opens
+    // actually exceed. The env-override arg forces it deterministically.
+    applyAdaptiveMaxOpen(16 * 2 ** 30, '10');
 
-    // MAX_OPEN is 10. Borrow ws0 and HOLD it in-flight, then open >MAX_OPEN more
+    // Cap is 10. Borrow ws0 and HOLD it in-flight, then open >cap more
     // workspaces to force eviction. The pinned ws0 must NEVER be closed.
     const HELD = 'wsheld';
     const heldDir = embeddedDataDir(cfg, HELD);

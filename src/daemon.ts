@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, readAtlasToken } from './config.js';
 import { startAtlasMcpServer } from './mcp/server.js';
 import { startLore, type LoreSidecarHandle } from './sidecar/loreSidecar.js';
-import { closeAllEmbedded, hasOpenEmbedded, openEmbeddedInstances, setPendingFlushPredicate } from './mcp/embeddedRegistry.js';
+import { closeAllEmbedded, hasOpenEmbedded, openEmbeddedInstances, setPendingFlushPredicate, applyAdaptiveMaxOpen } from './mcp/embeddedRegistry.js';
 import { flushVerbatimQueue, replayVerbatimJournal, isDirFlushPendingEligible, VERBATIM_SHUTDOWN_FLUSH_MS } from './mcp/verbatimQueue.js';
 import { drainIndexWork } from './lore/indexDrain.js';
 
@@ -214,6 +214,28 @@ export async function runDaemon(opts: { port?: number } = {}): Promise<void> {
 
     process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
     process.on('SIGINT',  () => { void shutdown('SIGINT'); });
+
+    // ── 0. Memory-aware embedded-registry cap ───────────────────────────────
+    // MAX_OPEN (concurrently-open embedded stores, LRU-capped) used to be a
+    // fixed 10 — dangerous on a small machine, needlessly tight on a big one.
+    // Derive it ONCE here, before any store can open, from the machine's
+    // total memory (formula + input rationale: computeAdaptiveMaxOpen in
+    // embeddedRegistry.ts). Boot-time, not per-call, so the cap is
+    // predictable for a given machine; the chosen value is also exposed on
+    // the workspace_status health surface (registryPolicy). ATLAS_EMBEDDED_
+    // MAX_OPEN forces a specific value for operators.
+    const maxOpen = applyAdaptiveMaxOpen();
+    if (maxOpen.source === 'env-override') {
+        console.error(`[atlas] embedded registry MAX_OPEN=${maxOpen.maxOpen} (forced via ATLAS_EMBEDDED_MAX_OPEN)`);
+    } else {
+        console.error(
+            `[atlas] embedded registry MAX_OPEN=${maxOpen.maxOpen} (adaptive: ` +
+                `${(maxOpen.totalMemBytes / 2 ** 30).toFixed(0)}GiB total mem × ` +
+                `${(maxOpen.memBudgetBytes! / maxOpen.totalMemBytes).toFixed(2)} budget ` +
+                `÷ ~${Math.round(maxOpen.perWorkspaceBytes / 2 ** 20)}MiB per open workspace, ` +
+                `clamped to [${maxOpen.minOpen}, ${maxOpen.ceiling}])`,
+        );
+    }
 
     // ── 0a. Pin-while-pending wiring (verbatim flush drain) ─────────────────
     // Inject verbatimQueue's flush-pending predicate into the embedded

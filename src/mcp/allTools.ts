@@ -17,7 +17,7 @@ import { flagUnbackedWork } from '../pmDecision.js';
 import { resolveLoreContext, tokenMissingError } from './context.js';
 import { scrubKnowledgeFields } from '../security/secretScrub.js';
 import { resolveCodeReader } from './loreReaderFactory.js';
-import { withEmbeddedLore, borrowEmbeddedLore, closeEmbeddedLore, embeddedBaseDir, embeddedDataDir, embeddedDirLifecycle } from './embeddedRegistry.js';
+import { withEmbeddedLore, borrowEmbeddedLore, closeEmbeddedLore, embeddedBaseDir, embeddedDataDir, embeddedDirLifecycle, embeddedMaxOpen } from './embeddedRegistry.js';
 import { verbatimQueueHealth } from './verbatimQueue.js';
 import { writeStatsSnapshot, buildWorkspaceStatsEntry } from './statsSnapshot.js';
 import { acquireWorkspaceWriteLock, WorkspaceLockedError } from '../lore/writerLock.js';
@@ -1191,7 +1191,8 @@ export function buildRegistry(bootTimeMs: number): ToolRegistry {
                     const dir = embeddedDataDir(cfg, wsName);
                     if (!fs.existsSync(dir)) {
                         return { ok: true, embedded: true, workspace: wsName, exists: false, dataDir: dir,
-                            verbatimQueue: verbatimQueueHealth(wsName), registry: embeddedDirLifecycle(dir) };
+                            verbatimQueue: verbatimQueueHealth(wsName), registry: embeddedDirLifecycle(dir),
+                            registryPolicy: embeddedMaxOpen() };
                     }
                     return withEmbeddedLore(cfg, wsName, async (lore) => {
                         // RD-status-oom — count via Cypher count(), NOT listNodes/
@@ -1237,6 +1238,11 @@ export function buildRegistry(bootTimeMs: number): ToolRegistry {
                             // reads; never open a store for them.
                             verbatimQueue: verbatimQueueHealth(wsName),
                             registry: embeddedDirLifecycle(dir),
+                            // Registry cap policy (2026-08 Phase B): the
+                            // memory-adaptive MAX_OPEN decision and its inputs,
+                            // so an operator can SEE what cap was chosen and why
+                            // (not just that one was silently applied).
+                            registryPolicy: embeddedMaxOpen(),
                         };
                     });
                 } catch (err) {

@@ -65,6 +65,7 @@
     "test:recall-search-isolation": "tsx tests/recall-search-isolation.test.ts",
     "test:verbatim": "tsx tests/verbatim.test.ts",
     "test:close-lock": "tsx tests/close-lock-timeout.test.ts",
+    "test:adaptive-max-open": "tsx tests/adaptive-max-open.test.ts",
     "test:index-parity": "tsx tests/index-parity.test.ts",
     "test:incremental-single-file": "tsx tests/incremental-single-file.test.ts",
     "test:mcp-index-reconcile-scope": "tsx tests/mcp-index-reconcile-scope.test.ts",

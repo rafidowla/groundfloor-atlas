@@ -9,7 +9,8 @@
  *   CLAIM B — EmbeddedLore.open(dataDir)             → per-workspace dataDir 0700
  *   CLAIM C — installService                          → ATLAS_HOME 0700 (audit finding)
  *
- * POSIX-only mode assertions are skipped on win32.
+ * POSIX-only mode assertions are skipped on win32; CLAIM C (installService)
+ * asserts the macOS-only effect on darwin and the refusal guard elsewhere.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -54,6 +55,10 @@ async function main(): Promise<void> {
         }
 
         // ── CLAIM C — installService hardens ATLAS_HOME ──────────────────────
+        // `atlas service` is macOS-only by design (LaunchAgents — see
+        // cli/service.ts darwinGuard) and must REFUSE elsewhere. Same
+        // convention as tests/service.test.ts: assert the 0700 effect on
+        // darwin, assert the guard on every other platform.
         {
             const home = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-fm-c-'));
             const lad = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-fm-lad-'));
@@ -62,9 +67,14 @@ async function main(): Promise<void> {
             // dev:true uses the tsx entry (no dist/daemon.js needed) so the test
             // runs without a build. The fake exec no-ops launchctl unload/load.
             const r = installService({ dev: true }, { launchAgentsDir: lad, exec, home });
-            assert.ok(r.ok, `installService ok (${JSON.stringify(r)})`);
-            if (!isWin) assert.equal(mode(home), 0o700, `CLAIM C: ATLAS_HOME 0700, got ${mode(home).toString(8)}`);
-            console.log('  ✓ CLAIM C: installService → ATLAS_HOME 0700');
+            if (process.platform === 'darwin') {
+                assert.ok(r.ok, `installService ok (${JSON.stringify(r)})`);
+                assert.equal(mode(home), 0o700, `CLAIM C: ATLAS_HOME 0700, got ${mode(home).toString(8)}`);
+                console.log('  ✓ CLAIM C: installService → ATLAS_HOME 0700');
+            } else {
+                assert.equal(r.ok, false, `installService refuses on ${process.platform} (${JSON.stringify(r)})`);
+                console.log(`  ✓ CLAIM C: installService refuses on ${process.platform} (macOS-only LaunchAgent)`);
+            }
         }
 
         console.log('All file-mode claims passed — dirs are owner-only 0700.');

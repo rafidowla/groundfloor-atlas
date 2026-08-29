@@ -56,7 +56,16 @@ async function testWalkerSymlinkCycle(cleanup: string[]): Promise<void> {
     fs.writeFileSync(path.join(dir3, 'pkg', 'mod.ts'), 'export const z = 3;\n');
     fs.symlinkSync('pkg', path.join(dir3, 'alias'));
     const rels3 = [...walkRepo(dir3)].map((p) => path.relative(dir3, p).split(path.sep).join('/')).sort();
-    assert.deepEqual(rels3, ['pkg/mod.ts'], `first-seen real dir wins; alias skipped (got ${rels3.join(', ')})`);
+    // WHICH entry readdir(3) yields first — the real dir `pkg` or the in-root
+    // symlink `alias` — is filesystem-order-dependent (macOS/APFS and
+    // Linux/ext4 disagree), and the walker's contract is dedupe-by-realpath:
+    // first-seen real dir wins. Assert the INVARIANT, not the order — exactly
+    // one yield, and it resolves to the one real file.
+    assert.equal(
+        fs.realpathSync(path.join(dir3, rels3[0])),
+        fs.realpathSync(path.join(dir3, 'pkg', 'mod.ts')),
+        `the single yield is the real file, via pkg/ or alias/ (got ${rels3[0]})`,
+    );
     console.log('  ✓ CLAIM C4c: legitimate in-root symlinks still index (deduped by realpath)');
 }
 

@@ -67,6 +67,14 @@ jobs:
       - run: npm run check:node-abi
       - run: npm run check:license
       - run: npm run guard
+
+      # The daemon SERVES the browser UI from atlas-ui/dist — a gitignored
+      # build artifact, absent on a fresh checkout. tests/e2e.test.ts
+      # (Suite F "UI Build Artefacts") and tests/rc-webserve.test.ts both gate
+      # the built UI, so build it once before test:all (the same `npm run
+      # build:ui` step `npm run package` / prepack use; it does its own
+      # `npm ci` inside atlas-ui/ — the root install doesn't cover it).
+      - run: npm run build:ui
       - run: npm run test:all
 
       # ── Packaging sanity: prove the published tarball actually ships the

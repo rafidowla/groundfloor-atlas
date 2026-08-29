@@ -31,9 +31,19 @@ async function main(): Promise<void> {
 
     try {
         // ── WRITE: index a real dir through the shared embedded instance ──────
+        // resume:false — this test asserts a FULL write→read cycle into a fresh
+        // per-run dataDir. `npm run guard` runs this same file BEFORE
+        // `npm run test:all` does (EMBEDDED_SUITES), and the first run leaves
+        // an index-resume checkpoint at src/resolver/.atlas/index-state.json
+        // stamped with this same workspace. Unchanged files + default resume
+        // mode then skip EVERY write into this run's brand-new (empty) dataDir,
+        // and the reader below sees zero symbols. The checkpoint refers to a
+        // store that no longer exists — force the full re-index this test
+        // actually means to exercise (resume semantics have their own test:
+        // tests/checkpoint.test.ts).
         const target = path.resolve('src/resolver');
         const lore = await getEmbeddedLore(cfg, WS);
-        const idx = (await runIndexTool(lore, { path: target }, WS, cfg)) as {
+        const idx = (await runIndexTool(lore, { path: target, resume: false }, WS, cfg)) as {
             filesIndexed?: number; nodesWritten?: number; edgesWritten?: number;
         };
         assert.ok((idx.nodesWritten ?? 0) > 0, `index wrote nodes; got ${JSON.stringify(idx)}`);

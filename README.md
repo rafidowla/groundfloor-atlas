@@ -2,15 +2,24 @@
 
 Groundfloor Atlas is Groundfloor's code-intelligence engine. By default it embeds a dedicated Lore in-process (its own surrealdb + lancedb + sqlite under the Atlas data dir) — no separate Lore daemon, port, or auth token to provision. It owns the tree-sitter parser, cross-file resolver, call-graph analytics, and git-signal layer that previously lived in `lore-plugin-developer`. As of X4 Groundfloor Atlas can also expose an MCP server on `127.0.0.1:3848` so IDE clients can connect — the endpoint presents a three-tool shim (`atlas_tool_list`, `atlas_tool_schema`, `atlas_tool_invoke`) through which clients discover and invoke the underlying code-intelligence operations (`atlas_health` plus the analytics tools). The legacy `http` mode (set `lore.mode: 'http'`) is a clearly opt-in path where Groundfloor Atlas instead READs from a separate Lore over REST (`/api/nodes`, `/api/node`) and WRITES via Lore's MCP `store_node` / `store_edge` (X3 wiring); the REST/MCP/token framing below applies only to that mode. `atlas index <path>` builds the index; `atlas serve` exposes the MCP endpoint for IDE clients; `atlas health` is the liveness check.
 
+![Groundfloor Atlas live demo](docs/demo.gif)
+
+*Live: searching the code graph, opening a node, and asking a real question in chat.*
+
 ## Quick start (CLI + browser UI)
 
 The daemon serves its own browser UI directly — there is no separate desktop
 app or bundled Node runtime to install.
 
-> **Install reality check:** `@groundfloor/atlas` is **not published to npm**
-> (the package is private, and the tarball can't resolve its Lore engine
-> dependency — see `docs/PACKAGING.md`). Install from source or from the
-> self-contained release bundle instead:
+> **Install reality check:** `@groundfloor/atlas` is **not published to npm**, and a
+> tarball packed from this repo **does not install** for anyone outside this
+> checkout: the Lore engine is pinned as `"@groundfloor/lore": "file:vendor/…"`,
+> and npm resolves `file:` dependencies against the *installer's* filesystem —
+> never from inside the shipped tarball. (Verified empirically — npm 10.9.8 and
+> 11.19.1, tarball-path and local-registry installs, with and without `vendor/`
+> in the `files` whitelist: all fail with `ENOENT
+> …/node_modules/@groundfloor/atlas/vendor/groundfloor-lore-3.16.0.tgz`.)
+> Install from source or from the self-contained release bundle instead:
 
 ```bash
 # From source (this repo):
@@ -19,6 +28,14 @@ npm install && npm run build
 # …or from the self-contained release bundle (no npm install needed at all):
 #   scripts/release-build.sh   → produces the zipped bundle under release/
 ```
+
+> A working npm tarball has been measured end-to-end: it requires
+> `"bundleDependencies": ["@groundfloor/lore"]` plus `"scripts/"` in `files`
+> (the shipped CLI imports `scripts/memory-merge-driver.mjs` at runtime). That
+> tarball installs cleanly, `atlas --help` runs, and the embedded engine
+> imports — but it is ~470 MB with platform-locked native modules inside, and
+> neither that change nor a publish has happened. Until one does, source and
+> the release bundle are the only install paths.
 
 Then install it as a background service and open the URL it prints:
 

@@ -47,14 +47,34 @@ only a matching Node runtime.
 > tarball does NOT contain `node_modules/@groundfloor/lore` (the actual
 > embedded engine: surrealdb + lancedb + better-sqlite3 + onnxruntime + the e5
 > model). The `dist/lore/*.js` files inside the tarball are Atlas's OWN thin
-> adapter code (compiled from `src/lore/*.ts`), **not** the engine. Installing
-> that tarball therefore still has to *resolve* `@groundfloor/lore` from
-> somewhere — and that dependency is pinned to the committed
+> adapter code (compiled from `src/lore/*.ts`), **not** the engine.
+> Installing that tarball therefore still has to *resolve* `@groundfloor/lore`
+> from somewhere — and that dependency is pinned to the committed
 > `file:vendor/groundfloor-lore-3.16.0.tgz`, which the npm tarball does not
-> carry, so a real end user's `npm install` of the tarball **fails at
-> dependency resolution** (it would need either Lore published to a registry
-> or `vendor/` added to the `files` whitelist and accepted as package
-> payload). `npm pack` only becomes a viable ship vehicle once Lore itself is
+> carry. Empirically (re-verified 2026-08-28, npm 10.9.8 and 11.19.1,
+> isolated-consumer installs of the packed tarball AND of a publish to a local
+> registry): a `file:` spec in a shipped manifest is resolved against the
+> *installer's* filesystem — the destination
+> `node_modules/@groundfloor/atlas/vendor/…` path — never from inside the
+> shipped artifact, so the install fails with `ENOENT` before extracting
+> anything. **Adding `vendor/` to the `files` whitelist does not fix this**
+> (tested: the vendored tarball ships, the install still fails identically).
+> Two mechanisms actually work: (a) publish `@groundfloor/lore` to a registry
+> and depend on it by version, or (b) declare `"bundleDependencies":
+> ["@groundfloor/lore"]` so npm embeds the engine (and its dependency tree)
+> inside the tarball. Note (b) has a second prerequisite measured the hard
+> way: `"scripts/"` must also be in `files`, because the shipped CLI
+> (`dist/cli/memorySync.js`, `dist/memoryFile.js`, `dist/cli/gitHooks.js`)
+> imports `scripts/memory-merge-driver.mjs` at runtime — without it the CLI
+> crashes with `ERR_MODULE_NOT_FOUND` even though the install succeeds. With
+> both, an isolated `npm install` of the tarball was verified end-to-end:
+> install exits 0, `atlas --help` exits 0, and the engine imports with its
+> real exports. The cost: ~470 MB packed / 1.4 GB installed, with the build
+> machine's platform/ABI-locked native modules embedded. Retesting warning:
+> installing the packed tarball *from inside this repo* produces a false
+> success — npm falls back to `<repo>/vendor/…` on your own disk; always copy
+> the tarball to a neutral directory first. `npm pack` only becomes a viable
+> ship vehicle once Lore itself is
 > published to a registry (see the git-dependency writeup below). **Until
 > then, the self-contained bundle is how Atlas ships to anyone who does not
 > have the Lore source tree** — it is the artifact that sidesteps publishing

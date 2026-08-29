@@ -2,9 +2,22 @@
 
 Groundfloor Atlas is Groundfloor's code-intelligence engine. By default it embeds a dedicated Lore in-process (its own surrealdb + lancedb + sqlite under the Atlas data dir) — no separate Lore daemon, port, or auth token to provision. It owns the tree-sitter parser, cross-file resolver, call-graph analytics, and git-signal layer that previously lived in `lore-plugin-developer`. As of X4 Groundfloor Atlas can also expose an MCP server on `127.0.0.1:3848` so IDE clients can connect — the endpoint presents a three-tool shim (`atlas_tool_list`, `atlas_tool_schema`, `atlas_tool_invoke`) through which clients discover and invoke the underlying code-intelligence operations (`atlas_health` plus the analytics tools). The legacy `http` mode (set `lore.mode: 'http'`) is a clearly opt-in path where Groundfloor Atlas instead READs from a separate Lore over REST (`/api/nodes`, `/api/node`) and WRITES via Lore's MCP `store_node` / `store_edge` (X3 wiring); the REST/MCP/token framing below applies only to that mode. `atlas index <path>` builds the index; `atlas serve` exposes the MCP endpoint for IDE clients; `atlas health` is the liveness check.
 
+## Demos
+
+Two live recordings: the browser UI first, then the same engine driven by an
+AI coding agent over MCP.
+
 ![Groundfloor Atlas live demo](docs/demo.gif)
 
 *Live: searching the code graph, opening a node, and asking a real question in chat.*
+
+![Groundfloor Atlas terminal demo](docs/terminal-demo.gif)
+
+*Live: an AI coding agent asking Atlas a structural question instead of
+grepping — one real `atlas_blast_radius` call, then the measured result from
+`bench/claims-task2.mjs`: 81–97% fewer tokens and 89–95% fewer tool calls
+than grep-based exploration. The blast-radius projection shown is
+reproducible via `bench/demo-blast.mjs`.*
 
 ## Quick start (CLI + browser UI)
 
